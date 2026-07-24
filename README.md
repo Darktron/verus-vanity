@@ -6,7 +6,7 @@ sudo apt install rustc
 or
 
 ```
-pkg install rustc
+pkg install rust
 ```
 
 ```
