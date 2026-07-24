@@ -1,5 +1,5 @@
 # verus-vanity
-Verus Vanity Wallet Generator
+Veruscoin Vanity Wallet Generator
 
 1. Get Rust:
 ```
