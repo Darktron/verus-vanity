@@ -1,5 +1,7 @@
 # verus-vanity
 Verus Vanity Wallet Generator
+
+1. Get Rust:
 ```
 sudo apt update && sudo apt install rustc
 ```
@@ -9,23 +11,22 @@ or
 pkg update && pkg install rust
 ```
 
+2. Clone the repo:
 ```
 git clone https://github.com/Darktron/verus-vanity.git
 ```
 
+3. Build & move:
 ```
-cd ~/verus-vanity
-cargo build --release
-```
-
-```
-mv ~/verus-vanity/target/release/verus-vanity ~/verus-vanity/
+cd ~/verus-vanity && cargo build --release && mv ~/verus-vanity/target/release/verus-vanity ~/verus-vanity/
 ```
 
+4. Use example:
 ```
 ~/verus-vanity/verus-vanity -m 1 -p RDARK -o wallets.txt
 ```
 
+5. Help & options:
 ```
 ~/verus-vanity/verus-vanity -h
 ```
