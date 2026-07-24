@@ -1,12 +1,12 @@
 # verus-vanity
 Verus Vanity Wallet Generator
 ```
-sudo apt install rustc
+sudo apt update && sudo apt install rustc
 ```
 or
 
 ```
-pkg install rust
+pkg update && pkg install rust
 ```
 
 ```
@@ -19,7 +19,7 @@ cargo build --release
 ```
 
 ```
-mv ~/verus-vanity/target/release/verus-vanity ~/verus-vanity
+mv ~/verus-vanity/target/release/verus-vanity ~/verus-vanity/
 ```
 
 ```
