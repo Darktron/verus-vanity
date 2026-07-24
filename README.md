@@ -44,3 +44,4 @@ Options:
   -h, --help               Print help
   -V, --version            Print version
 ```
+Performance achieved 950,000 - 1,250,000 wallets per second (0.95-1.25MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores)
