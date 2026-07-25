@@ -34,10 +34,11 @@ cd ~/verus-vanity && cargo build --release && mv ~/verus-vanity/target/release/v
 ```
 VerusCoin Vanity Wallet Generator
 
-Usage: verus-vanity [OPTIONS] --prefix <prefix>
+Usage: verus-vanity [OPTIONS]
 
 Options:
-  -p, --prefix <prefix>    Prefix string or filename with prefixes (one per line)
+  -p, --prefix <prefix>    Prefix string or filename with prefixes (one per line). 'R' is added automatically if omitted.
+  -s, --suffix <suffix>    Suffix string or filename with suffixes (one per line)
   -m, --matches <matches>  Number of matching addresses to find; -1 for infinite [default: -1]
   -t, --threads <threads>  Number of threads (default = number of CPU cores) [default: 12]
   -o, --output <output>    Output file to save found wallets
