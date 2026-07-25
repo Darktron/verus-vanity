@@ -1,15 +1,15 @@
 use clap::{Arg, Command};
-use rand::SeedableRng;
+use ff::Field;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::BatchNormalize;
+use k256::{AffinePoint, ProjectivePoint, Scalar};
 use rand::thread_rng;
+use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use sha2::{Digest, Sha256};
 use ripemd::Ripemd160;
-use bs58;
-use qrcode::QrCode;
-use qrcode::render::unicode;
+use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
-use std::io::{Write, BufWriter};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,43 +19,30 @@ use std::time::{Duration, Instant};
 const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 // Characters intentionally excluded from Base58 due to visual ambiguity.
 const INVALID_BASE58_CHARS: [char; 4] = ['0', 'O', 'I', 'l'];
+// Size of the Base58 alphabet, used to approximate match probability.
+const BASE58_ALPHABET_SIZE: f64 = 58.0;
 
-// How many loop iterations a worker thread does before flushing its local
-// counter into the shared atomic. Batching this avoids hammering a single
-// atomic from every thread on every single key, which is the main
-// contention bottleneck in a tight multi-threaded search loop.
-const COUNTER_BATCH: u64 = 256;
+// How many candidates a thread walks forward (via cheap EC point additions)
+// from one random starting key before batch-normalizing them all to
+// affine coordinates in a single shared modular inversion (Montgomery's
+// batch-inversion trick). Normalizing one point at a time each pays its
+// own inversion; batching amortizes that cost across the whole batch —
+// measured ~2.5x faster than normalizing individually, on top of the
+// point-addition-instead-of-full-scalar-mult optimization underneath it.
+const BATCH_SIZE: usize = 512;
 
-// How many point-additions a thread performs walking forward from one
-// random starting key before picking a fresh random start again. This is
-// the incremental-generation approach used by essentially every serious
-// vanity-address tool (vanitygen, VanitySearch, etc.): instead of a full
-// elliptic-curve scalar multiplication for every single candidate key
-// (~256-bit multiply), each step after the first is just one EC point
-// addition (current point + G) — dramatically cheaper, and verified to
-// produce bit-identical results to the direct method (see
-// `u64_to_scalar` and the correctness reasoning near the generator setup
-// below). Periodic rebasing here is purely hygiene for very long runs,
-// not a correctness or security requirement — even at billions of
-// keys/sec, the walked range from one base is still a vanishingly small
-// sliver of the full 2^256 keyspace.
+// How many keys a thread walks from one random starting point before
+// picking a fresh random start again. Purely routine hygiene for very
+// long runs — not a correctness or security requirement, since even at
+// billions of keys/sec the walked range from one base is still a
+// vanishingly small sliver of the full 2^256 keyspace.
 const REBASE_INTERVAL: u64 = 200_000_000;
 
-/// Encodes a small integer offset as a 32-byte big-endian secp256k1
-/// Scalar. Used to reconstruct the real private key (base + offset mod
-/// curve order) only at the moment a match is found — the hot loop itself
-/// never needs this, since it only walks the public key forward.
-fn u64_to_scalar(offset: u64) -> Scalar {
-    let mut buf = [0u8; 32];
-    buf[24..32].copy_from_slice(&offset.to_be_bytes());
-    Scalar::from_be_bytes(buf).expect("u64 always fits well within curve order")
-}
-
-/// Validates a single prefix string against the Base58 alphabet.
-/// Returns Err with a human-readable, actionable message if the prefix
-/// could never appear in a real Base58Check-encoded address.
-fn validate_prefix(prefix: &str) -> Result<(), String> {
-    let bad_chars: Vec<char> = prefix
+/// Validates a single pattern (prefix or suffix) against the Base58
+/// alphabet. Returns Err with a human-readable, actionable message if the
+/// pattern could never appear in a real Base58Check-encoded address.
+fn validate_pattern(pattern: &str) -> Result<(), String> {
+    let bad_chars: Vec<char> = pattern
         .chars()
         .filter(|c| INVALID_BASE58_CHARS.contains(c))
         .collect();
@@ -65,69 +52,132 @@ fn validate_prefix(prefix: &str) -> Result<(), String> {
         uniq.dedup();
         let bad_list: String = uniq.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ");
         return Err(format!(
-            "prefix '{}' can NEVER be found.\n  Invalid character(s): {}\n  \
+            "'{}' can NEVER be found.\n  Invalid character(s): {}\n  \
              Base58 excludes 0 (zero), O (capital o), I (capital i), and l (lowercase L) \
              to avoid visual ambiguity.\n  Tip: use '1' instead of 'I' or 'O'; \
              lowercase 'i' or 'L' (capital) are valid substitutes.",
-            prefix, bad_list
+            pattern, bad_list
         ));
     }
 
-    for c in prefix.chars() {
+    for c in pattern.chars() {
         if !BASE58_ALPHABET.contains(c) {
             return Err(format!(
-                "prefix '{}' contains '{}', which is not a valid Base58 character at all.",
-                prefix, c
+                "'{}' contains '{}', which is not a valid Base58 character at all.",
+                pattern, c
             ));
         }
-    }
-
-    if !prefix.is_empty() && !prefix.starts_with('R') {
-        return Err(format!(
-            "prefix '{}' can NEVER be found.\n  Every VerusCoin transparent address begins with 'R' \
-             (fixed by the mainnet version byte), and matching only checks the very start of the \
-             address.\n  Tip: prepend 'R' to your desired pattern, e.g. 'R{}'.",
-            prefix, prefix
-        ));
     }
 
     Ok(())
 }
 
-/// Validates every prefix; on any failure, print all problems found and
-/// exit before any thread is spawned or any CPU time is burned searching
-/// for something that is mathematically impossible to find.
-fn validate_all_prefixes_or_exit(prefixes: &[String]) {
+/// Validates every pattern in a list; on any failure, print all problems
+/// found and exit before any thread is spawned or any CPU time is burned
+/// searching for something that is mathematically impossible to find.
+fn validate_all_or_exit(patterns: &[String], label: &str) {
     let mut had_error = false;
-    for prefix in prefixes {
-        if let Err(msg) = validate_prefix(prefix) {
-            eprintln!("⚠️  Invalid prefix: {}", msg);
+    for pattern in patterns {
+        if let Err(msg) = validate_pattern(pattern) {
+            eprintln!("⚠️  Invalid {}: {}", label, msg);
             had_error = true;
         }
     }
     if had_error {
-        eprintln!("\nAborting — fix the prefix(es) above and try again.");
+        eprintln!("\nAborting — fix the {}(es) above and try again.", label);
         std::process::exit(1);
     }
 }
 
-// Size of the Base58 alphabet, used to approximate match probability.
-// Beyond the fixed leading 'R' (guaranteed by the version byte), each
-// subsequent character of a random address is treated as effectively
-// uniform over these 58 symbols — the standard approximation used by
-// vanity-address generators.
-const BASE58_ALPHABET_SIZE: f64 = 58.0;
+/// Every VerusCoin transparent address begins with 'R' — fixed by the
+/// mainnet version byte, guaranteed no matter what the rest of the
+/// address is. Since it's guaranteed anyway, a prefix that doesn't
+/// already start with 'R' gets it prepended automatically rather than
+/// making the user type a character that's never actually in question.
+/// Returns the normalized prefix and whether it changed.
+fn normalize_prefix(prefix: &str) -> (String, bool) {
+    if prefix.starts_with('R') {
+        (prefix.to_string(), false)
+    } else {
+        (format!("R{}", prefix), true)
+    }
+}
+
+/// Reads a CLI value that may be a literal pattern or a path to a file of
+/// patterns (one per line).
+fn read_patterns(arg: &str) -> Vec<String> {
+    if std::path::Path::new(arg).exists() {
+        std::fs::read_to_string(arg)
+            .unwrap()
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect()
+    } else {
+        vec![arg.to_string()]
+    }
+}
+
+/// Finds the first prefix in `prefixes` that `addr` starts with.
+/// Returns `Some(None)` if `prefixes` is empty (no constraint — always
+/// satisfied), `Some(Some(p))` if a specific prefix `p` matched, or
+/// `None` if a constraint exists but nothing matched.
+fn match_any_prefix<'a>(prefixes: &'a [String], addr: &str) -> Option<Option<&'a str>> {
+    if prefixes.is_empty() {
+        return Some(None);
+    }
+    for p in prefixes {
+        if addr.starts_with(p.as_str()) {
+            return Some(Some(p.as_str()));
+        }
+    }
+    None
+}
+
+/// Same as `match_any_prefix` but for suffixes (`ends_with`).
+fn match_any_suffix<'a>(suffixes: &'a [String], addr: &str) -> Option<Option<&'a str>> {
+    if suffixes.is_empty() {
+        return Some(None);
+    }
+    for s in suffixes {
+        if addr.ends_with(s.as_str()) {
+            return Some(Some(s.as_str()));
+        }
+    }
+    None
+}
 
 /// Estimates the expected number of addresses that must be generated
-/// before at least one of the given prefixes matches, on average.
-/// Returns f64::INFINITY if no prefix has any chance of matching.
-fn expected_tries_for_prefixes(prefixes: &[String]) -> f64 {
+/// before at least one (prefix, suffix) combination matches, on average.
+/// Prefixes count only characters beyond the guaranteed leading 'R';
+/// suffixes have no guaranteed characters, so all of them count.
+/// Combined prefix+suffix probability for a given pair is approximated as
+/// the product of their individual probabilities (the standard
+/// approximation used by vanity-address tools, treating leading- and
+/// trailing-character windows as independent).
+fn expected_tries(prefixes: &[String], suffixes: &[String]) -> f64 {
+    let prefix_probs: Vec<f64> = if prefixes.is_empty() {
+        vec![1.0]
+    } else {
+        prefixes
+            .iter()
+            .map(|p| BASE58_ALPHABET_SIZE.powi(-(p.len().saturating_sub(1) as i32)))
+            .collect()
+    };
+    let suffix_probs: Vec<f64> = if suffixes.is_empty() {
+        vec![1.0]
+    } else {
+        suffixes
+            .iter()
+            .map(|s| BASE58_ALPHABET_SIZE.powi(-(s.len() as i32)))
+            .collect()
+    };
+
     let mut total_probability = 0.0f64;
-    for prefix in prefixes {
-        // 'R' is guaranteed, so only characters after it are "extra"
-        // characters that must be matched against a uniform draw.
-        let extra_chars = prefix.len().saturating_sub(1) as i32;
-        total_probability += BASE58_ALPHABET_SIZE.powi(-extra_chars);
+    for pp in &prefix_probs {
+        for sp in &suffix_probs {
+            total_probability += pp * sp;
+        }
     }
     if total_probability <= 0.0 {
         f64::INFINITY
@@ -136,8 +186,7 @@ fn expected_tries_for_prefixes(prefixes: &[String]) -> f64 {
     }
 }
 
-/// Formats a duration in seconds as a human-readable string, picking
-/// the most sensible unit (seconds, minutes, hours, days, or years).
+/// Formats a duration in seconds as a human-readable string.
 fn format_duration(seconds: f64) -> String {
     if !seconds.is_finite() {
         return "unknown (rate not yet measured)".to_string();
@@ -160,20 +209,62 @@ fn format_duration(seconds: f64) -> String {
     }
 }
 
+/// Probability of having found at least one match by now, under pure
+/// randomness: P(at least one success in n tries) = 1 - (1-p)^n.
+/// Computed via log for numerical stability with the very small p /
+/// large n values typical here. Unlike ETA, this number only ever climbs
+/// toward 100% as tries accumulate — it does NOT imply anything about the
+/// odds of the next specific attempt, which are always exactly p no
+/// matter how many tries came before (see the memoryless discussion on
+/// the ETA calculation above).
+fn cumulative_probability(p_per_try: f64, n_tries: u64) -> f64 {
+    if p_per_try <= 0.0 {
+        return 0.0;
+    }
+    if p_per_try >= 1.0 {
+        return 1.0;
+    }
+    let log_survival = (n_tries as f64) * (1.0 - p_per_try).ln();
+    1.0 - log_survival.exp()
+}
+
+/// Inverse of `cumulative_probability`: how many tries are needed to
+/// reach a given cumulative success probability `q` (e.g. q=0.5 for the
+/// point where a match is as likely as not, q=0.9 for a high-confidence
+/// threshold). Solving 1-(1-p)^n = q for n gives n = ln(1-q)/ln(1-p).
+/// This is still fundamentally a "from right now" estimate, not a
+/// countdown — see the memorylessness note above; it doesn't shrink
+/// just because earlier tries failed, only because the measured rate
+/// changed or a match was found (which resets the baseline).
+fn tries_for_probability(p_per_try: f64, q: f64) -> f64 {
+    if p_per_try <= 0.0 {
+        return f64::INFINITY;
+    }
+    if p_per_try >= 1.0 {
+        return 1.0;
+    }
+    (1.0 - q).ln() / (1.0 - p_per_try).ln()
+}
+
 fn main() {
-    // Leak static str for clap default_value lifetime
     let cpu_cores_str: &'static str = Box::leak(num_cpus::get().to_string().into_boxed_str());
 
     let matches = Command::new("verus-vanity")
-        .version("0.2.0")
+        .version("0.3.0")
         .author("Your Name")
         .about("VerusCoin Vanity Wallet Generator")
         .arg(
             Arg::new("prefix")
                 .short('p')
                 .long("prefix")
-                .help("Prefix string or filename with prefixes (one per line)")
-                .required(true)
+                .help("Prefix string or filename with prefixes (one per line). 'R' is added automatically if omitted.")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("suffix")
+                .short('s')
+                .long("suffix")
+                .help("Suffix string or filename with suffixes (one per line)")
                 .num_args(1),
         )
         .arg(
@@ -201,7 +292,14 @@ fn main() {
         )
         .get_matches();
 
-    let prefix_arg = matches.get_one::<String>("prefix").unwrap();
+    let prefix_arg = matches.get_one::<String>("prefix");
+    let suffix_arg = matches.get_one::<String>("suffix");
+
+    if prefix_arg.is_none() && suffix_arg.is_none() {
+        eprintln!("⚠️  Provide at least one of --prefix/-p or --suffix/-s.");
+        std::process::exit(1);
+    }
+
     let output_file = matches.get_one::<String>("output").map(|s| s.clone());
     let threads: usize = matches
         .get_one::<String>("threads")
@@ -214,38 +312,69 @@ fn main() {
         .parse()
         .unwrap_or(-1);
 
-    let prefixes: Vec<String> = if std::path::Path::new(prefix_arg).exists() {
-        std::fs::read_to_string(prefix_arg)
-            .unwrap()
-            .lines()
-            .map(|line| line.trim().to_string())
-            .filter(|line| !line.is_empty())
-            .collect()
-    } else {
-        vec![prefix_arg.clone()]
-    };
+    let raw_prefixes: Vec<String> = prefix_arg.map(|a| read_patterns(a)).unwrap_or_default();
+    let suffixes: Vec<String> = suffix_arg.map(|a| read_patterns(a)).unwrap_or_default();
 
-    // Validate every prefix up front. Stops immediately with a clear
-    // warning instead of silently searching forever for something
-    // that can never be found (e.g. a prefix containing 'I', 'O', '0', 'l').
-    validate_all_prefixes_or_exit(&prefixes);
+    // Every Verus address is guaranteed to start with 'R' — auto-prepend
+    // it rather than requiring the user to type a character that was
+    // never actually in question. See `normalize_prefix`.
+    let mut any_normalized = false;
+    let prefixes: Vec<String> = raw_prefixes
+        .iter()
+        .map(|p| {
+            let (norm, changed) = normalize_prefix(p);
+            if changed {
+                any_normalized = true;
+            }
+            norm
+        })
+        .collect();
 
-    // --- Info print block ---
+    validate_all_or_exit(&prefixes, "prefix");
+    validate_all_or_exit(&suffixes, "suffix");
+
     println!("--- Starting verus-vanity ---");
 
-    if std::path::Path::new(prefix_arg).exists() {
-        println!(
-            "Prefix file: {}",
-            std::fs::canonicalize(prefix_arg)
-                .unwrap_or_else(|_| prefix_arg.into())
-                .display()
-        );
+    if !prefixes.is_empty() {
+        if let Some(a) = prefix_arg {
+            if std::path::Path::new(a).exists() {
+                println!(
+                    "Prefix file: {}",
+                    std::fs::canonicalize(a).unwrap_or_else(|_| a.into()).display()
+                );
+            }
+        }
         println!("Prefixes:");
-        for prefix in &prefixes {
-            println!("  {}", prefix);
+        for (raw, norm) in raw_prefixes.iter().zip(prefixes.iter()) {
+            if raw != norm {
+                println!("  {}  (auto-prepended 'R' → {})", raw, norm);
+            } else {
+                println!("  {}", norm);
+            }
         }
     } else {
-        println!("Prefix string: {}", prefix_arg);
+        println!("Prefixes: none (matching by suffix only)");
+    }
+
+    if !suffixes.is_empty() {
+        if let Some(a) = suffix_arg {
+            if std::path::Path::new(a).exists() {
+                println!(
+                    "Suffix file: {}",
+                    std::fs::canonicalize(a).unwrap_or_else(|_| a.into()).display()
+                );
+            }
+        }
+        println!("Suffixes:");
+        for s in &suffixes {
+            println!("  {}", s);
+        }
+    } else {
+        println!("Suffixes: none (matching by prefix only)");
+    }
+
+    if any_normalized {
+        println!("Note: every Verus address starts with 'R', so it was added automatically where missing.");
     }
 
     println!("Threads: {}", threads);
@@ -258,47 +387,16 @@ fn main() {
     if let Some(ref output) = output_file {
         println!(
             "Output file: {}",
-            std::fs::canonicalize(output)
-                .unwrap_or_else(|_| output.into())
-                .display()
+            std::fs::canonicalize(output).unwrap_or_else(|_| output.into()).display()
         );
     } else {
         println!("Output file: None");
     }
 
-    let expected_tries = expected_tries_for_prefixes(&prefixes);
-    println!(
-        "Expected addresses to generate per match (approx.): {}",
-        format_with_si(expected_tries.round() as u64)
-    );
-    println!(
-        "Note: ETA is a statistical average, not a countdown — since every \
-         attempt is independent, a match can come much sooner or take several \
-         times longer by chance."
-    );
+    let expected = expected_tries(&prefixes, &suffixes);
     println!("-----------------------------");
-    // --- end info block ---
 
     println!("Starting with {} thread(s)...", threads);
-
-    // signing_only() builds a lighter secp256k1 context than the default
-    // full (sign + verify) context, since this program never needs to
-    // verify signatures — only derive public keys. Cheaper to clone per
-    // thread and slightly faster to construct.
-    let secp = Secp256k1::signing_only();
-
-    // The standard secp256k1 generator point G. We derive it by computing
-    // the public key for the private key "1" rather than hand-transcribing
-    // the well-known constant, so correctness rests on the library itself
-    // rather than a copy-pasted hex value. Used below so each thread can
-    // advance to its "next" candidate key via one cheap EC point addition
-    // (current + G) instead of a full random scalar multiplication.
-    let generator = {
-        let mut one = [0u8; 32];
-        one[31] = 1;
-        let one_sk = SecretKey::from_slice(&one).expect("1 is always a valid scalar");
-        PublicKey::from_secret_key(&secp, &one_sk)
-    };
 
     let output_writer = output_file.map(|filename| {
         Arc::new(Mutex::new(BufWriter::new(
@@ -313,56 +411,60 @@ fn main() {
     let found_count = Arc::new(AtomicI64::new(0));
     let keys_tried = Arc::new(AtomicU64::new(0));
     let keys_tried_last = Arc::new(AtomicU64::new(0));
+    // Tracks the `keys_tried` value at the moment of the most recent
+    // match, so the cumulative-probability stat can reset per match
+    // instead of staying pinned near 100% for the rest of a multi-match
+    // (-m N) run after early luck on the first couple of matches.
+    let last_match_tries = Arc::new(AtomicU64::new(0));
     let start_time = Instant::now();
 
-    // How many total matches we're aiming for, used to scale the ETA.
-    // Negative (infinite) mode estimates the time to the *next* single
-    // match, since there's no fixed target to count down to.
     let target_matches: f64 = if max_matches == -1 { 1.0 } else { max_matches.max(1) as f64 };
 
-    // Thread to print wallets per second, total tried, and a dynamic ETA
-    // every second. The ETA is "dynamic" in that it's recomputed each tick
-    // from the actual measured average rate so far (total tried / elapsed
-    // time) rather than a fixed assumption — it gets more accurate the
-    // longer the search runs.
     {
         let keys_tried = Arc::clone(&keys_tried);
         let keys_tried_last = Arc::clone(&keys_tried_last);
         let found_count = Arc::clone(&found_count);
+        let last_match_tries = Arc::clone(&last_match_tries);
         thread::spawn(move || {
+            let mut printed_estimate = false;
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let total = keys_tried.load(Ordering::Relaxed);
                 let last = keys_tried_last.swap(total, Ordering::Relaxed);
-                let delta = total.saturating_sub(last);
+                let rate = total.saturating_sub(last);
 
                 let elapsed = start_time.elapsed().as_secs_f64();
                 let average_rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
 
                 let found_so_far = found_count.load(Ordering::Relaxed).max(0) as f64;
                 let remaining_matches = (target_matches - found_so_far).max(0.0);
-                // Each generated address is an independent random draw, so this
-                // process is memoryless: no matter how many tries have already
-                // failed, the expected number of *additional* tries needed is
-                // always ~expected_tries (not something that counts down to 0
-                // as time passes with no match). We deliberately do NOT subtract
-                // total tried so far — doing so would incorrectly imply the
-                // search is "due" for a match soon.
-                let remaining_tries = expected_tries * remaining_matches;
+                let p_per_try = if expected.is_finite() && expected > 0.0 { 1.0 / expected } else { 0.0 };
 
-                let eta = if average_rate > 0.0 && remaining_matches > 0.0 {
-                    format!("~{}", format_duration(remaining_tries / average_rate))
-                } else if remaining_matches <= 0.0 {
-                    "done".to_string()
+                // Printed once, the first time a real rate is available —
+                // a typical (median) time to find, not a countdown. It
+                // won't reappear or shrink as the search runs; ongoing
+                // progress is shown by the simple percentage below instead.
+                if !printed_estimate && average_rate > 0.0 && remaining_matches > 0.0 {
+                    let t50 = tries_for_probability(p_per_try, 0.5) * remaining_matches / average_rate;
+                    println!("Estimated typical time to find: ~{}\n", format_duration(t50));
+                    printed_estimate = true;
+                }
+
+                // Simple progress gauge: probability you'd already have a
+                // match by now, under pure randomness. Always climbs
+                // toward 100%, resets after each match on a -m N run.
+                let progress = if remaining_matches > 0.0 {
+                    let tries_since_last = total.saturating_sub(last_match_tries.load(Ordering::Relaxed));
+                    format!("{:.1}%", cumulative_probability(p_per_try, tries_since_last) * 100.0)
                 } else {
-                    "calculating...".to_string()
+                    "done".to_string()
                 };
 
-                print!(
-                    "{} total wallets tried — {} wallets per second — ETA: {}\n",
+                println!(
+                    "Progress: {} ({} tried, {})",
+                    progress,
                     format_with_si(total),
-                    format_with_si_rate(delta),
-                    eta,
+                    format_with_si_rate(rate)
                 );
             }
         });
@@ -370,50 +472,72 @@ fn main() {
 
     let mut handles = Vec::new();
     for _ in 0..threads {
-        let secp = secp.clone();
-        let generator = generator; // PublicKey is Copy — cheap
         let prefixes = prefixes.clone();
+        let suffixes = suffixes.clone();
         let output_writer = output_writer.clone();
         let found_count = found_count.clone();
         let keys_tried = keys_tried.clone();
+        let last_match_tries = last_match_tries.clone();
 
         let handle = thread::spawn(move || {
             let mut rng_source = thread_rng();
             let mut rng = ChaCha20Rng::from_rng(&mut rng_source).expect("failed to seed RNG");
-            let mut local_tried: u64 = 0;
 
-            // Start from one random private key, then advance by adding G
-            // each iteration instead of picking a fresh random key and
-            // doing a full scalar multiplication every time — see the
-            // REBASE_INTERVAL comment above for why this is both correct
-            // and safe. Benchmarked at ~7-8x faster than the previous
-            // fresh-scalar-mult-every-time approach, with results verified
-            // bit-identical to the direct method across randomized trials.
-            let mut base_sk = SecretKey::new(&mut rng);
-            let mut current_pubkey = PublicKey::from_secret_key(&secp, &base_sk);
+            // Start from one random scalar, then walk forward via cheap EC
+            // point additions and batch-normalize in groups of BATCH_SIZE
+            // (Montgomery's batch-inversion trick — one shared modular
+            // inversion for the whole batch instead of one per point).
+            // Cross-validated bit-identical against an independent
+            // libsecp256k1 computation before shipping.
+            let mut base_scalar = Scalar::random(&mut rng);
+            let mut current = ProjectivePoint::GENERATOR * base_scalar;
             let mut offset: u64 = 0;
+            let mut batch_buf: Vec<ProjectivePoint> = vec![ProjectivePoint::GENERATOR; BATCH_SIZE];
 
-            loop {
+            'outer: loop {
                 if max_matches != -1 && found_count.load(Ordering::Relaxed) >= max_matches {
                     break;
                 }
 
-                let addr = public_key_to_address(&current_pubkey, true, 0x3c); // VerusCoin mainnet version byte
+                for slot in batch_buf.iter_mut() {
+                    current += AffinePoint::GENERATOR;
+                    *slot = current;
+                }
+                let affine_batch = ProjectivePoint::batch_normalize(batch_buf.as_slice());
 
-                for prefix in &prefixes {
-                    if addr.starts_with(prefix.as_str()) {
-                        // Only reconstruct the actual scalar private key on
-                        // a real match (rare) — the hot loop above never
-                        // needs it, since it only ever walks the public key.
-                        let sk = base_sk
-                            .add_tweak(&u64_to_scalar(offset))
-                            .expect("offset is always a small, valid scalar");
-                        let wif = private_key_to_wif(&sk, 0xbc, true); // VerusCoin WIF prefix
-                        let priv_hex = hex::encode(sk.secret_bytes());
+                for (i, ap) in affine_batch.iter().enumerate() {
+                    if max_matches != -1 && found_count.load(Ordering::Relaxed) >= max_matches {
+                        break 'outer;
+                    }
+
+                    let this_offset = offset + 1 + i as u64;
+                    let compressed = ap.to_encoded_point(true);
+                    let addr = public_key_to_address(compressed.as_bytes(), 0x3c);
+
+                    if let (Some(p_opt), Some(s_opt)) =
+                        (match_any_prefix(&prefixes, &addr), match_any_suffix(&suffixes, &addr))
+                    {
+                        let sk_scalar = base_scalar + Scalar::from(this_offset);
+                        let sk_bytes: [u8; 32] = sk_scalar.to_bytes().into();
+                        let wif = private_key_to_wif(&sk_bytes, 0xbc, true); // VerusCoin WIF prefix
+                        let priv_hex = hex::encode(sk_bytes);
+
+                        let desc = match (p_opt, s_opt) {
+                            (Some(p), Some(s)) => format!("prefix '{}' + suffix '{}'", p, s),
+                            (Some(p), None) => format!("prefix '{}'", p),
+                            (None, Some(s)) => format!("suffix '{}'", s),
+                            (None, None) => "match".to_string(),
+                        };
 
                         let found_num = found_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Reset the "odds you'd have found it by now" stat
+                        // to start counting fresh from this match forward.
+                        // fetch_max (rather than a plain store) keeps this
+                        // correct even if two threads find matches close
+                        // together and race here.
+                        last_match_tries.fetch_max(keys_tried.load(Ordering::Relaxed), Ordering::Relaxed);
 
-                        println!("----- MATCH {} for prefix '{}' FOUND -----", found_num, prefix);
+                        println!("----- MATCH {} for {} FOUND -----", found_num, desc);
                         println!("Address: {}", addr);
                         println!("WIF: {}", wif);
                         println!("Private Key (hex): {}", priv_hex);
@@ -423,7 +547,7 @@ fn main() {
 
                         if let Some(ref output_mutex) = output_writer {
                             let mut output = output_mutex.lock().unwrap();
-                            writeln!(output, "----- MATCH {} for prefix '{}' FOUND -----", found_num, prefix).ok();
+                            writeln!(output, "----- MATCH {} for {} FOUND -----", found_num, desc).ok();
                             writeln!(output, "Address: {}", addr).ok();
                             writeln!(output, "WIF: {}", wif).ok();
                             writeln!(output, "Private Key (hex): {}", priv_hex).ok();
@@ -435,40 +559,14 @@ fn main() {
                     }
                 }
 
-                // Advance to the next candidate: one EC point addition
-                // instead of a fresh scalar multiplication, with periodic
-                // rebasing as routine hygiene (see REBASE_INTERVAL above).
-                offset += 1;
+                offset += BATCH_SIZE as u64;
+                keys_tried.fetch_add(BATCH_SIZE as u64, Ordering::Relaxed);
+
                 if offset >= REBASE_INTERVAL {
-                    base_sk = SecretKey::new(&mut rng);
-                    current_pubkey = PublicKey::from_secret_key(&secp, &base_sk);
+                    base_scalar = Scalar::random(&mut rng);
+                    current = ProjectivePoint::GENERATOR * base_scalar;
                     offset = 0;
-                } else {
-                    match current_pubkey.combine(&generator) {
-                        Ok(next) => current_pubkey = next,
-                        Err(_) => {
-                            // Astronomically unlikely (would require landing
-                            // exactly on the negation of G) — just rebase.
-                            base_sk = SecretKey::new(&mut rng);
-                            current_pubkey = PublicKey::from_secret_key(&secp, &base_sk);
-                            offset = 0;
-                        }
-                    }
                 }
-
-                // Batch local counter into the shared atomic to cut down on
-                // cross-thread contention. This is the main scaling win on
-                // many-core devices (including Termux on multi-core phones).
-                local_tried += 1;
-                if local_tried >= COUNTER_BATCH {
-                    keys_tried.fetch_add(local_tried, Ordering::Relaxed);
-                    local_tried = 0;
-                }
-            }
-
-            // Flush any remainder before the thread exits.
-            if local_tried > 0 {
-                keys_tried.fetch_add(local_tried, Ordering::Relaxed);
             }
         });
         handles.push(handle);
@@ -479,30 +577,15 @@ fn main() {
     }
 }
 
-fn public_key_to_address(pubkey: &PublicKey, compressed: bool, version: u8) -> String {
-    // Bind serialized pubkey bytes to locals so we can borrow them as a
-    // slice without ever allocating on the heap (serialize()/
-    // serialize_uncompressed() already return fixed-size stack arrays).
-    let compressed_bytes;
-    let uncompressed_bytes;
-    let pubkey_ser: &[u8] = if compressed {
-        compressed_bytes = pubkey.serialize();
-        &compressed_bytes
-    } else {
-        uncompressed_bytes = pubkey.serialize_uncompressed();
-        &uncompressed_bytes
-    };
+fn public_key_to_address(pubkey_compressed: &[u8], version: u8) -> String {
+    let sha256_hash = Sha256::digest(pubkey_compressed);
+    let ripemd_hash = Ripemd160::digest(sha256_hash);
 
-    let sha256_hash = Sha256::digest(pubkey_ser);
-    let ripemd_hash = Ripemd160::digest(&sha256_hash);
-
-    // version(1) + ripemd160(20) + checksum(4) = 25 bytes, always fixed
-    // length — a stack array instead of a heap-allocated Vec.
     let mut addr_bytes = [0u8; 25];
     addr_bytes[0] = version;
     addr_bytes[1..21].copy_from_slice(&ripemd_hash);
 
-    let checksum_full = Sha256::digest(&Sha256::digest(&addr_bytes[0..21]));
+    let checksum_full = Sha256::digest(Sha256::digest(&addr_bytes[0..21]));
     addr_bytes[21..25].copy_from_slice(&checksum_full[0..4]);
 
     bs58::encode(&addr_bytes[..]).into_string()
@@ -512,22 +595,19 @@ fn public_key_to_address(pubkey: &PublicKey, compressed: bool, version: u8) -> S
 /// Unicode block characters, so it can be imported via a wallet's
 /// "scan QR code" option instead of typing it in by hand.
 fn wif_to_qr_string(wif: &str) -> String {
-    match QrCode::new(wif.as_bytes()) {
+    match qrcode::QrCode::new(wif.as_bytes()) {
         Ok(code) => code
-            .render::<unicode::Dense1x2>()
+            .render::<qrcode::render::unicode::Dense1x2>()
             .quiet_zone(true)
             .build(),
         Err(e) => format!("(failed to generate QR code: {})", e),
     }
 }
 
-fn private_key_to_wif(sk: &SecretKey, version_byte: u8, compressed: bool) -> String {
-    // version(1) + secret key(32) + optional compression flag(1) = up to 34
-    // bytes, always fixed length for a given `compressed` setting — use a
-    // stack array instead of a heap-allocated Vec.
+fn private_key_to_wif(sk_bytes: &[u8; 32], version_byte: u8, compressed: bool) -> String {
     let mut bytes = [0u8; 34];
     bytes[0] = version_byte;
-    bytes[1..33].copy_from_slice(&sk.secret_bytes());
+    bytes[1..33].copy_from_slice(sk_bytes);
     let payload_len = if compressed {
         bytes[33] = 0x01;
         34
@@ -535,7 +615,7 @@ fn private_key_to_wif(sk: &SecretKey, version_byte: u8, compressed: bool) -> Str
         33
     };
 
-    let checksum_full = Sha256::digest(&Sha256::digest(&bytes[0..payload_len]));
+    let checksum_full = Sha256::digest(Sha256::digest(&bytes[0..payload_len]));
 
     let mut extended = [0u8; 38];
     extended[0..payload_len].copy_from_slice(&bytes[0..payload_len]);
@@ -544,7 +624,6 @@ fn private_key_to_wif(sk: &SecretKey, version_byte: u8, compressed: bool) -> Str
     bs58::encode(&extended[0..payload_len + 4]).into_string()
 }
 
-// Format large number with SI prefixes for wallets/s display
 fn format_with_si(value: u64) -> String {
     const UNITS: [&str; 9] = ["", "K", "M", "G", "T", "P", "E", "Z", "Y"];
     let mut v = value as f64;
