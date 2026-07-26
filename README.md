@@ -5,6 +5,7 @@ Veruscoin Vanity Wallet Generator
 ```
 sudo apt update && sudo apt install rustc
 ```
+
 or
 
 ```
@@ -16,17 +17,29 @@ pkg update && pkg install rust
 git clone https://github.com/Darktron/verus-vanity.git
 ```
 
-3. Build & move:
+3. Build:
 ```
-cd ~/verus-vanity && cargo build --release && mv ~/verus-vanity/target/release/verus-vanity ~/verus-vanity/
+cd ~/verus-vanity && cargo build --release
 ```
 
-4. Use example:
+or
+
+
+```
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+4. Move the binary:
+```
+mv ~/verus-vanity/target/release/verus-vanity ~/verus-vanity/
+```
+
+5. Use example:
 ```
 ~/verus-vanity/verus-vanity -m 1 -p RDARK -o wallets.txt
 ```
 
-5. Help & options:
+6. Help & options:
 ```
 ~/verus-vanity/verus-vanity -h
 ```
@@ -51,3 +64,5 @@ verus-vanity v0.2.0 performance achieved 950,000 - 1,250,000 wallets per second 
 verus-vanity v0.3.0 performance achieved 2,850,000 - 3,150,000 wallets per second (2.85 - 3.15MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) all modes
 
 verus-vanity v0.3.0a performance achieved 6,500,000 - 8,100,000 wallets per second (6.50 - 8.10MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) --prefix only
+
+verus-vanity v0.4.0 performance achieved 8,880,000 - 10,550,000 wallets per second (8.88 - 10.55MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) --prefix only
