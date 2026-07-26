@@ -524,8 +524,8 @@ fn parse_cli() -> Config {
     let cpu_cores_str: &'static str = Box::leak(num_cpus::get().to_string().into_boxed_str());
 
     let matches = Command::new("verus-vanity")
-        .version("0.3.0")
-        .author("Your Name")
+        .version("0.4.0")
+        .author("Darktron")
         .about("VerusCoin Vanity Wallet Generator")
         .arg(
             Arg::new("prefix")
