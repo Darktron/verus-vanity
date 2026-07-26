@@ -26,7 +26,7 @@ or
 
 
 ```
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+cd ~/verus-vanity && RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 4. Move the binary:
