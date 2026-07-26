@@ -19,14 +19,14 @@ git clone https://github.com/Darktron/verus-vanity.git
 
 3. Build:
 ```
-cd ~/verus-vanity && cargo build --release
+cd ~/verus-vanity && RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 or
 
 
 ```
-cd ~/verus-vanity && RUSTFLAGS="-C target-cpu=native" cargo build --release
+cd ~/verus-vanity && cargo build --release
 ```
 
 4. Move the binary:
