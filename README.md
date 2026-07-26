@@ -36,7 +36,7 @@ mv ~/verus-vanity/target/release/verus-vanity ~/verus-vanity/
 
 5. Use example:
 ```
-~/verus-vanity/verus-vanity -m 1 -p RDARK -o wallets.txt
+~/verus-vanity/verus-vanity -m 1 -p RVerus -o wallets.txt
 ```
 
 6. Help & options:
