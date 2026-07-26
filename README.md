@@ -1,5 +1,5 @@
 # verus-vanity
-Veruscoin Vanity Wallet Generator
+## Veruscoin Vanity Wallet Generator
 
 1. Get Rust:
 ```
@@ -59,10 +59,13 @@ Options:
   -V, --version            Print version
 ```
 
+### Affixes:
 ```
-Affixes:
-$${\color{red}Prefixes \space \color{lightblue}Infixes \space \color{orange}Suffixes}$$
-$${\color{red}crypt \space \color{lightblue}ograph \space \color{orange}y}$$
+Prefix: Crypt (Start)
+Infix: ograph (Middle)
+Suffix: y (End)
+
+All: Cryptography
 ```
 
 verus-vanity v0.2.0 performance achieved 950,000 - 1,250,000 wallets per second (0.95 - 1.25MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) all modes
