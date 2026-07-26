@@ -3,13 +3,13 @@
 
 1. Get Rust:
 ```
-sudo apt update && sudo apt install rustc
+sudo apt update && sudo apt install rustc git
 ```
 
 or
 
 ```
-pkg update && pkg install rust
+pkg update && pkg install rust git
 ```
 
 2. Clone the repo:
