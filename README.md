@@ -46,17 +46,19 @@ mv ~/verus-vanity/target/release/verus-vanity ~/verus-vanity/
 
 ```
 VerusCoin Vanity Wallet Generator
+Made by Darktron
 
 Usage: verus-vanity [OPTIONS]
 
 Options:
-  -p, --prefix <prefix>    Prefix string or filename with prefixes (one per line). 'R' is added automatically if omitted.
+  -p, --prefix <prefix>    Prefix string or filename with prefixes (one per line)
+  -i, --infix <infix>      Infix string or filename with infixes (one per line)
   -s, --suffix <suffix>    Suffix string or filename with suffixes (one per line)
   -m, --matches <matches>  Number of matching addresses to find; -1 for infinite [default: -1]
   -t, --threads <threads>  Number of threads (default = number of CPU cores) [default: 12]
   -o, --output <output>    Output file to save found wallets
+  -v, --version            Print version
   -h, --help               Print help
-  -V, --version            Print version
 ```
 
 ### Affixes:
@@ -75,3 +77,5 @@ verus-vanity v0.3.0 performance achieved 2,850,000 - 3,150,000 wallets per secon
 verus-vanity v0.3.0a performance achieved 6,500,000 - 8,100,000 wallets per second (6.50 - 8.10MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) --prefix only
 
 verus-vanity v0.4.0 performance achieved 8,880,000 - 10,550,000 wallets per second (8.88 - 10.55MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) --prefix only
+
+verus-vanity v0.5.0 performance achieved 7,000,000 - 8,770,000 wallets per second (8.88 - 10.55MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) --suffix only
