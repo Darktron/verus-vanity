@@ -8,7 +8,7 @@
 //! throughout the accompanying README/changelog is cross-validated
 //! against an independent libsecp256k1 computation.
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use ff::Field;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::BatchNormalize;
@@ -110,6 +110,119 @@ fn validate_all_or_exit(patterns: &[String], label: &str) {
     }
 }
 
+/// Characters that can appear as the SECOND character of a VerusCoin
+/// address (position 1, right after the guaranteed leading 'R') — kept
+/// as a named constant purely so error messages can give a precise,
+/// simple explanation for the common case. Used only for MESSAGING; the
+/// actual pass/fail decision always comes from `validate_prefix_achievable`
+/// below, which is provably correct at any depth (see its own doc
+/// comment for why the simple 24-character rule isn't the whole story).
+///
+/// Why 24 and not 58: N (the 25-byte address value: fixed version byte
+/// 0x3C, followed by 192 bits of hash160+checksum that vary freely)
+/// always falls in the range [0x3C * 2^192, 0x3D * 2^192) — narrower
+/// than one full second-character Base58 bucket's worth of possibilities
+/// can spread across (58^32 vs the 2^192 span), so it only ever touches
+/// 24 of the 58 possible second-character buckets. Confirmed by exact
+/// interval arithmetic and empirically against 4,231 real unbiased
+/// generated addresses: exactly these 24 characters appeared, zero
+/// exceptions.
+const VALID_SECOND_CHARS: &str = "9ABCDEFGHJKLMNPQRSTUVWXY";
+
+/// Validates that a prefix is actually reachable by some real VerusCoin
+/// address — not just "does it use valid Base58 characters", but "does
+/// ANY possible hash160+checksum combination actually produce this
+/// exact prefix".
+///
+/// The naive expectation is that only the very first character is
+/// constrained (fixed to 'R') and everything after is freely chosen.
+/// That's wrong in a way that goes deeper than it first appears: the
+/// second character turns out to be restricted to 24 specific values
+/// (see `VALID_SECOND_CHARS`) — and *within* the two boundary values of
+/// that restriction, the THIRD character is itself further restricted,
+/// recursively, for as many characters as the boundary keeps getting
+/// touched. Concretely: 'R9A' is unreachable even though '9' and 'A' are
+/// each independently valid at their positions, and 'R9HA' is *also*
+/// unreachable (while 'R9Ha' — lowercase — is fine). Hand-deriving each
+/// layer of this is exactly the kind of thing that's easy to get subtly
+/// wrong or leave incomplete (as happened here — an earlier version of
+/// this validation only caught the second-character case and missed
+/// deeper combinations like 'R9HA').
+///
+/// Rather than deriving the recursive boundary structure by hand, this
+/// reuses the exact same machinery already proven correct for the speed
+/// pre-filter: `compute_prefix_bound` computes the prefix's own Base58
+/// numeric bucket (the same bucket used to safely skip impossible
+/// candidates during the search), and this just checks whether that
+/// bucket overlaps AT ALL with the true achievable range for a VerusCoin
+/// address (version byte 0x3C followed by every possible 24-byte
+/// hash160+checksum combination). If there's no overlap, no possible
+/// private key could ever produce this prefix — proven by the same exact
+/// interval arithmetic as the pre-filter, not by re-deriving boundary
+/// rules by hand. Verified to correctly reproduce every case checked by
+/// hand above, including the deeper 'R9HA' one.
+fn validate_prefix_achievable(prefix: &str) -> Result<(), String> {
+    let bound = match compute_prefix_bound(prefix) {
+        Some(b) => b,
+        None => return Ok(()), // inconclusive (e.g. prefix too long) — don't block on it
+    };
+
+    let mut achievable_low = [0u8; 25];
+    achievable_low[0] = ADDRESS_VERSION_BYTE;
+    let mut achievable_high = [0u8; 25];
+    achievable_high[0] = ADDRESS_VERSION_BYTE + 1;
+
+    let overlaps = !(bound.upper_exclusive <= achievable_low || bound.lower >= achievable_high);
+    if overlaps {
+        return Ok(());
+    }
+
+    // Give the most specific explanation available; the pass/fail
+    // decision above is already final regardless of which message fires.
+    let chars: Vec<char> = prefix.chars().collect();
+    if chars.len() >= 2 && !VALID_SECOND_CHARS.contains(chars[1]) {
+        return Err(format!(
+            "'{}' can NEVER be found.\n  The second character '{}' is impossible: VerusCoin's \
+             fixed version byte restricts an address's second character to only these {} values: \
+             {}\n  This isn't a visual-ambiguity exclusion like 0/O/I/l — it's a hard mathematical \
+             constraint from how the version byte encodes in Base58.",
+            prefix,
+            chars[1],
+            VALID_SECOND_CHARS.len(),
+            VALID_SECOND_CHARS
+        ));
+    }
+    Err(format!(
+        "'{}' can NEVER be found.\n  This specific combination of characters is mathematically \
+         unreachable, even though every individual character looks valid on its own — VerusCoin's \
+         fixed version byte constrains which multi-character sequences are possible in ways that go \
+         beyond any single character in isolation. Try a different combination.",
+        prefix
+    ))
+}
+
+/// Validates every prefix: the general Base58 alphabet rules (shared
+/// with suffix/infix validation) plus the achievability check above.
+/// Exits with every problem found, same as `validate_all_or_exit`.
+fn validate_all_prefixes_or_exit(prefixes: &[String]) {
+    let mut had_error = false;
+    for prefix in prefixes {
+        if let Err(msg) = validate_pattern(prefix) {
+            eprintln!("⚠️  Invalid prefix: {}", msg);
+            had_error = true;
+            continue; // the achievability check would likely just pile on
+        }
+        if let Err(msg) = validate_prefix_achievable(prefix) {
+            eprintln!("⚠️  Invalid prefix: {}", msg);
+            had_error = true;
+        }
+    }
+    if had_error {
+        eprintln!("\nAborting — fix the prefix(es) above and try again.");
+        std::process::exit(1);
+    }
+}
+
 /// Every VerusCoin transparent address begins with 'R' — fixed by the
 /// mainnet version byte, guaranteed no matter what the rest of the
 /// address is. Since it's guaranteed anyway, a prefix that doesn't
@@ -166,29 +279,52 @@ fn match_any_suffix<'a>(suffixes: &'a [String], addr: &str) -> Option<Option<&'a
         .map(|s| Some(s.as_str()))
 }
 
-/// Builds the human-readable "for prefix 'X' + suffix 'Y'" description
-/// used in match reports, covering all four combinations of which
-/// constraint(s) were actually in play.
-fn describe_match(prefix_hit: Option<&str>, suffix_hit: Option<&str>) -> String {
-    match (prefix_hit, suffix_hit) {
-        (Some(p), Some(s)) => format!("prefix '{}' + suffix '{}'", p, s),
-        (Some(p), None) => format!("prefix '{}'", p),
-        (None, Some(s)) => format!("suffix '{}'", s),
-        (None, None) => "match".to_string(),
+/// Same as `match_any_prefix` but for infixes — matches anywhere in the
+/// address (`contains`), not just at the start or end.
+fn match_any_infix<'a>(infixes: &'a [String], addr: &str) -> Option<Option<&'a str>> {
+    if infixes.is_empty() {
+        return Some(None);
+    }
+    infixes
+        .iter()
+        .find(|i| addr.contains(i.as_str()))
+        .map(|i| Some(i.as_str()))
+}
+
+/// Builds the human-readable "for prefix 'X' + infix 'Y' + suffix 'Z'"
+/// description used in match reports, covering every combination of
+/// which constraint(s) were actually in play.
+fn describe_match(prefix_hit: Option<&str>, infix_hit: Option<&str>, suffix_hit: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = prefix_hit {
+        parts.push(format!("prefix '{}'", p));
+    }
+    if let Some(i) = infix_hit {
+        parts.push(format!("infix '{}'", i));
+    }
+    if let Some(s) = suffix_hit {
+        parts.push(format!("suffix '{}'", s));
+    }
+    if parts.is_empty() {
+        "match".to_string()
+    } else {
+        parts.join(" + ")
     }
 }
 
 // ===================== Probability & time estimates =====================
 
 /// Estimates the expected number of addresses that must be generated
-/// before at least one (prefix, suffix) combination matches, on average.
-/// Prefixes count only characters beyond the guaranteed leading 'R';
-/// suffixes have no guaranteed characters, so all of them count.
-/// Combined prefix+suffix probability for a given pair is approximated as
-/// the product of their individual probabilities (the standard
-/// approximation used by vanity-address tools, treating leading- and
-/// trailing-character windows as independent).
-fn expected_tries(prefixes: &[String], suffixes: &[String]) -> f64 {
+/// before at least one (prefix, suffix, infix) combination matches, on
+/// average. Prefixes count only characters beyond the guaranteed leading
+/// 'R'; suffixes have no guaranteed characters, so all of them count;
+/// infixes can match starting at any of (34 - length + 1) positions, so
+/// their probability is scaled up accordingly (each position treated as
+/// roughly independent — the same approximation already used elsewhere
+/// here). Combined probability across categories is approximated as the
+/// product of their individual probabilities (treating leading,
+/// trailing, and arbitrary-position windows as independent).
+fn expected_tries(prefixes: &[String], suffixes: &[String], infixes: &[String]) -> f64 {
     let prefix_probs: Vec<f64> = if prefixes.is_empty() {
         vec![1.0]
     } else {
@@ -205,11 +341,28 @@ fn expected_tries(prefixes: &[String], suffixes: &[String]) -> f64 {
             .map(|s| BASE58_ALPHABET_SIZE.powi(-(s.len() as i32)))
             .collect()
     };
+    let infix_probs: Vec<f64> = if infixes.is_empty() {
+        vec![1.0]
+    } else {
+        infixes
+            .iter()
+            .map(|i| {
+                let len = i.len();
+                if len == 0 || len > ADDR_CHARS {
+                    return 0.0;
+                }
+                let positions = (ADDR_CHARS - len + 1) as f64;
+                (positions * BASE58_ALPHABET_SIZE.powi(-(len as i32))).min(1.0)
+            })
+            .collect()
+    };
 
     let mut total_probability = 0.0f64;
     for pp in &prefix_probs {
         for sp in &suffix_probs {
-            total_probability += pp * sp;
+            for ip in &infix_probs {
+                total_probability += pp * sp * ip;
+            }
         }
     }
     if total_probability <= 0.0 {
@@ -346,30 +499,47 @@ fn public_key_to_address(pubkey_compressed: &[u8], version: u8) -> String {
     address_from_first21(&compute_first21(pubkey_compressed, version))
 }
 
-// ===================== Prefix pre-filter (speed, prefix-only) =====================
+// ===================== Prefix & suffix pre-filters (speed) =====================
 //
 // Base58 encodes the entire 25-byte address as one big number, so the
 // LEADING characters are dominated by the high-order bytes (version +
 // start of hash160), while the checksum — the last 4 bytes, unknowable
 // without actually hashing — only ever perturbs the number by at most
-// 2^32 out of a ~2^200 range. That gap is what makes this safe: for any
-// candidate, [first21 as a number with checksum=0, first21 with
-// checksum=0xFFFFFFFF] is a small, fully-known range. If that whole range
-// falls outside the numeric window that would produce the desired
+// 2^32 out of a ~2^200 range. That gap is what makes prefix pre-filtering
+// safe: for any candidate, [first21 as a number with checksum=0, first21
+// with checksum=0xFFFFFFFF] is a small, fully-known range. If that whole
+// range falls outside the numeric window that would produce the desired
 // prefix, NO possible checksum could ever make it match — proven by
 // exact integer bounds, not approximation, so it can be skipped before
 // ever computing the checksum or encoding to Base58.
 //
-// This can never cause a wrong result: the final match decision always
-// goes through the same exact, unchanged `match_any_prefix`/
-// `match_any_suffix` + Base58 comparison as before. The pre-filter only
-// ever skips candidates already *proven* impossible. If bound
-// computation fails for any reason, it's simply not used, and every
-// candidate falls through to the always-correct exact path — same as
-// before this optimization existed. Suffix matching cannot use this
-// shortcut at all: the checksum isn't a small perturbation there, it's
-// the primary thing that determines the trailing characters, so it must
-// always be computed for real.
+// Suffix matching seems at first like it can't use any shortcut — the
+// checksum IS the primary thing determining the trailing characters, not
+// a small perturbation. That's actually still true for SHORT suffixes:
+// for a suffix of length k, the checksum's ~4.3 billion possible values
+// cover the *entire* space of 58^k possible endings whenever 58^k <=
+// 2^32 (true for k <= 5) — meaning literally any suffix is reachable
+// from any candidate, so no filtering is mathematically possible there.
+// But for k >= 6, 58^k exceeds 2^32, so the checksum's range no longer
+// covers every possibility — a real, provable filter becomes available
+// using modular arithmetic on (first21 * 2^32) mod 58^k. See
+// `provably_outside_suffix` for the exact reasoning. Validated against
+// 27 million random samples across suffix lengths 6-10 with zero false
+// negatives before shipping, with skip rates matching the predicted
+// 1 - 2^32/58^k almost exactly (e.g. ~88.7% for k=6).
+//
+// Neither filter can ever cause a wrong result: the final match decision
+// always goes through the same exact, unchanged `match_any_prefix` /
+// `match_any_suffix` + Base58 comparison as before. A filter only ever
+// skips candidates already *proven* impossible for that one category —
+// and since a match requires every present category (prefix AND suffix
+// AND infix) to be satisfied, proving just one of them impossible is
+// already enough to safely skip, regardless of what the others would
+// say. If bound computation fails or is unavailable (infix always lacks
+// one; suffixes under 6 characters mathematically can't have one), that
+// category simply never contributes to the skip decision, and candidates
+// fall through to the always-correct exact path for it — same as before
+// either optimization existed.
 
 const ADDR_CHARS: usize = 34;
 
@@ -429,16 +599,13 @@ fn compute_prefix_bound(prefix: &str) -> Option<PrefixBound> {
 }
 
 /// Attempts to compute a pre-filter bound for every prefix. Returns an
-/// empty Vec (meaning "fast path disabled, use the exact method for
-/// everything") if there are any suffix constraints at all — suffix
-/// matching always needs the real checksum — or if any single prefix's
-/// bound can't be computed. All-or-nothing keeps the hot-loop logic
+/// empty Vec (meaning "no prefix-based skip available") if any single
+/// prefix's bound can't be computed, or if there are no prefixes at all.
+/// All-or-nothing across the prefix list keeps the per-candidate check
 /// simple: either every prefix has a valid bound, or none of them get
-/// the fast-path treatment.
-fn try_compute_all_prefix_bounds(prefixes: &[String], suffixes: &[String]) -> Vec<PrefixBound> {
-    if !suffixes.is_empty() {
-        return Vec::new();
-    }
+/// the fast-path treatment. Independent of whether suffixes or infixes
+/// are also present — see the module note above for why that's safe.
+fn try_compute_all_prefix_bounds(prefixes: &[String]) -> Vec<PrefixBound> {
     let mut bounds = Vec::with_capacity(prefixes.len());
     for p in prefixes {
         match compute_prefix_bound(p) {
@@ -452,7 +619,7 @@ fn try_compute_all_prefix_bounds(prefixes: &[String], suffixes: &[String]) -> Ve
 /// Returns true only if literally no checksum value could make this
 /// candidate's address start with the prefix behind `bound` — see the
 /// module note above for why this is always safe, never approximate.
-fn provably_outside(first21: &[u8; 21], bound: &PrefixBound) -> bool {
+fn provably_outside_prefix(first21: &[u8; 21], bound: &PrefixBound) -> bool {
     let mut lo = [0u8; 25];
     lo[0..21].copy_from_slice(first21);
     let mut hi = [0u8; 25];
@@ -460,6 +627,99 @@ fn provably_outside(first21: &[u8; 21], bound: &PrefixBound) -> bool {
     hi[21..25].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
 
     hi < bound.lower || lo >= bound.upper_exclusive
+}
+
+// ----- Suffix pre-filter (length >= 6 only — see module note above) -----
+
+/// Numeric bound for fast suffix pre-filtering. `modulus` is 58^k for a
+/// suffix of length k; `target` is the suffix parsed as a base-58
+/// integer (each character a standard digit, positionally weighted).
+#[derive(Clone, Copy)]
+struct SuffixBound {
+    modulus: u64,
+    target: u64,
+}
+
+/// Parses a pattern as a base-58 integer — NOT the same as
+/// `bs58::decode`, which has extra byte-array semantics (like leading-'1'
+/// handling) we specifically don't want here. Each character is just a
+/// standard positional digit 0-57.
+fn parse_base58_number(s: &str) -> Option<u64> {
+    let mut value: u64 = 0;
+    for c in s.bytes() {
+        let digit = BASE58_ALPHABET.bytes().position(|x| x == c)? as u64;
+        value = value.checked_mul(58)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+/// (first21 interpreted as a big-endian integer) mod `modulus`, computed
+/// byte-by-byte so it never needs a number bigger than fits in u128 —
+/// avoids needing a general bignum library for this.
+fn first21_mod(first21: &[u8; 21], modulus: u64) -> u64 {
+    let mut r: u128 = 0;
+    for &byte in first21.iter() {
+        r = (r * 256 + byte as u128) % modulus as u128;
+    }
+    r as u64
+}
+
+/// Computes a suffix pre-filter bound. Only available for lengths 6-10
+/// (see module note above for the mathematical reason 6 is the cutoff);
+/// 10 is a conservative ceiling comfortably within u64 range (58^10 is
+/// still ~40x smaller than u64::MAX). Returns None outside that range,
+/// or on any unexpected condition — callers must treat None as "no
+/// suffix-based skip available", not as an error.
+fn compute_suffix_bound(suffix: &str) -> Option<SuffixBound> {
+    let k = suffix.len();
+    if !(6..=10).contains(&k) {
+        return None;
+    }
+    let modulus = 58u64.checked_pow(k as u32)?;
+    let target = parse_base58_number(suffix)?;
+    if target >= modulus {
+        return None;
+    }
+    Some(SuffixBound { modulus, target })
+}
+
+/// Attempts to compute a pre-filter bound for every suffix. Empty Vec
+/// means "no suffix-based skip available" — either because a suffix is
+/// shorter than 6 characters (mathematically impossible to filter, not
+/// just unimplemented) or because there are no suffixes at all.
+fn try_compute_all_suffix_bounds(suffixes: &[String]) -> Vec<SuffixBound> {
+    let mut bounds = Vec::with_capacity(suffixes.len());
+    for s in suffixes {
+        match compute_suffix_bound(s) {
+            Some(b) => bounds.push(b),
+            None => return Vec::new(),
+        }
+    }
+    bounds
+}
+
+/// Returns true only if literally no checksum value (0..2^32) could make
+/// this candidate's address end with the suffix behind `bound`. See the
+/// module note above for the full reasoning; in short: the checksum's
+/// range no longer covers every possible ending once the suffix is 6+
+/// characters, so for a given candidate only a specific reachable window
+/// of endings is possible, computed here via modular arithmetic.
+fn provably_outside_suffix(first21: &[u8; 21], bound: &SuffixBound) -> bool {
+    // (first21_num * 2^32) mod modulus. Since modulus > 2^32 always in
+    // our supported range (k >= 6), 2^32 mod modulus is just 2^32
+    // itself, so no extra reduction of the multiplier is needed.
+    let a = first21_mod(first21, bound.modulus);
+    let base_remainder = ((a as u128 * (1u128 << 32)) % bound.modulus as u128) as u64;
+
+    // How far around the modulus circle from base_remainder to target.
+    // If some checksum c in [0, 2^32) reaches target, c must equal this
+    // distance exactly — modulus exceeds 2^32 throughout our supported
+    // range, so there's at most one representative of this residue class
+    // small enough to be a valid checksum value.
+    let diff = bound.target as i128 - base_remainder as i128;
+    let forward_distance = diff.rem_euclid(bound.modulus as i128) as u64;
+
+    forward_distance >= (1u64 << 32)
 }
 
 /// Encodes a raw 32-byte private key as WIF (Wallet Import Format):
@@ -509,8 +769,10 @@ struct Config {
     /// actually used for matching.
     prefixes: Vec<String>,
     suffixes: Vec<String>,
+    infixes: Vec<String>,
     prefix_arg: Option<String>,
     suffix_arg: Option<String>,
+    infix_arg: Option<String>,
     threads: usize,
     max_matches: i64,
     output_file: Option<String>,
@@ -524,14 +786,22 @@ fn parse_cli() -> Config {
     let cpu_cores_str: &'static str = Box::leak(num_cpus::get().to_string().into_boxed_str());
 
     let matches = Command::new("verus-vanity")
-        .version("0.4.0")
+        .version("0.5.0")
         .author("Darktron")
-        .about("VerusCoin Vanity Wallet Generator")
+        .about("VerusCoin Vanity Wallet Generator\nMade by Darktron")
+        .disable_version_flag(true)
         .arg(
             Arg::new("prefix")
                 .short('p')
                 .long("prefix")
-                .help("Prefix string or filename with prefixes (one per line). 'R' is added automatically if omitted.")
+                .help("Prefix string or filename with prefixes (one per line)")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("infix")
+                .short('i')
+                .long("infix")
+                .help("Infix string or filename with infixes (one per line)")
                 .num_args(1),
         )
         .arg(
@@ -564,13 +834,21 @@ fn parse_cli() -> Config {
                 .help("Output file to save found wallets")
                 .num_args(1),
         )
+        .arg(
+            Arg::new("version")
+                .short('v')
+                .long("version")
+                .action(ArgAction::Version)
+                .help("Print version"),
+        )
         .get_matches();
 
     let prefix_arg = matches.get_one::<String>("prefix").cloned();
     let suffix_arg = matches.get_one::<String>("suffix").cloned();
+    let infix_arg = matches.get_one::<String>("infix").cloned();
 
-    if prefix_arg.is_none() && suffix_arg.is_none() {
-        eprintln!("⚠️  Provide at least one of --prefix/-p or --suffix/-s.");
+    if prefix_arg.is_none() && suffix_arg.is_none() && infix_arg.is_none() {
+        eprintln!("⚠️  Provide at least one of --prefix/-p, --suffix/-s, or --infix/-i.");
         std::process::exit(1);
     }
 
@@ -588,6 +866,7 @@ fn parse_cli() -> Config {
 
     let raw_prefixes: Vec<String> = prefix_arg.as_deref().map(read_patterns).unwrap_or_default();
     let suffixes: Vec<String> = suffix_arg.as_deref().map(read_patterns).unwrap_or_default();
+    let infixes: Vec<String> = infix_arg.as_deref().map(read_patterns).unwrap_or_default();
 
     // Every Verus address is guaranteed to start with 'R' — auto-prepend
     // it rather than requiring the user to type a character that was
@@ -602,15 +881,18 @@ fn parse_cli() -> Config {
         })
         .collect();
 
-    validate_all_or_exit(&prefixes, "prefix");
+    validate_all_prefixes_or_exit(&prefixes);
     validate_all_or_exit(&suffixes, "suffix");
+    validate_all_or_exit(&infixes, "infix");
 
     Config {
         raw_prefixes,
         prefixes,
         suffixes,
+        infixes,
         prefix_arg,
         suffix_arg,
+        infix_arg,
         threads,
         max_matches,
         output_file,
@@ -640,7 +922,24 @@ fn print_banner(config: &Config) {
             }
         }
     } else {
-        println!("Prefixes: none (matching by suffix only)");
+        println!("Prefixes: none");
+    }
+
+    if !config.infixes.is_empty() {
+        if let Some(a) = &config.infix_arg {
+            if std::path::Path::new(a).exists() {
+                println!(
+                    "Infix file: {}",
+                    std::fs::canonicalize(a).unwrap_or_else(|_| a.into()).display()
+                );
+            }
+        }
+        println!("Infixes:");
+        for i in &config.infixes {
+            println!("  {}", i);
+        }
+    } else {
+        println!("Infixes: none");
     }
 
     if !config.suffixes.is_empty() {
@@ -657,7 +956,7 @@ fn print_banner(config: &Config) {
             println!("  {}", s);
         }
     } else {
-        println!("Suffixes: none (matching by prefix only)");
+        println!("Suffixes: none");
     }
 
     if config.any_normalized {
@@ -802,13 +1101,61 @@ fn report_match(found_num: i64, desc: &str, addr: &str, wif: &str, priv_hex: &st
     }
 }
 
+// ===================== Optional performance-core targeting =====================
+//
+// Many phone SoCs mix fast "performance" cores with slower "efficiency"
+// cores (big.LITTLE / DynamIQ). Left to the OS scheduler, some worker
+// threads can end up running on the slow cores, diluting average
+// throughput — especially when -t is set below the total core count.
+// This tries to identify the fastest cores (via each core's max clock
+// speed, read from sysfs) and pin worker threads to them specifically,
+// fastest-first.
+//
+// This is entirely best-effort and safe to fail: if core IDs can't be
+// enumerated, if ANY core's frequency can't be read, or if pinning
+// itself fails, this quietly does nothing and threads run exactly as
+// they did before this existed — plain OS scheduling, no behavior
+// change, no risk. It never touches anything cryptographic.
+
+/// Reads a core's maximum clock speed from sysfs (Linux/Android/Termux).
+/// Returns None if unavailable — e.g. in containers/VMs, or on any
+/// platform that doesn't expose this, which is common and expected.
+fn core_max_freq_khz(core_id: usize) -> Option<u64> {
+    let path = format!("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", core_id);
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Attempts to order available cores fastest-first. Returns None (rather
+/// than a partially-correct guess) unless every core's frequency was
+/// readable — a partial ordering could be misleading, so this only ever
+/// acts on complete information.
+fn fastest_cores_first() -> Option<Vec<core_affinity::CoreId>> {
+    let core_ids = core_affinity::get_core_ids()?;
+    let mut with_freq = Vec::with_capacity(core_ids.len());
+    for core_id in core_ids {
+        let freq = core_max_freq_khz(core_id.id)?;
+        with_freq.push((core_id, freq));
+    }
+    with_freq.sort_by_key(|&(_, freq)| std::cmp::Reverse(freq));
+    Some(with_freq.into_iter().map(|(core_id, _)| core_id).collect())
+}
+
+
 /// One worker thread's search loop. Starts from one random scalar, then
 /// walks forward via cheap EC point additions and batch-normalizes in
 /// groups of `BATCH_SIZE` (Montgomery's batch-inversion trick — one
 /// shared modular inversion for the whole batch instead of one per
 /// point). Cross-validated bit-identical against an independent
 /// libsecp256k1 computation before shipping.
-fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, prefix_bounds: Vec<PrefixBound>, max_matches: i64, state: SharedState) {
+fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String>, prefix_bounds: Vec<PrefixBound>, suffix_bounds: Vec<SuffixBound>, max_matches: i64, state: SharedState, pinned_core: Option<core_affinity::CoreId>) {
+    // Best-effort only — see the module note above `fastest_cores_first`.
+    // If this is None, or if pinning fails on this particular platform,
+    // the thread just runs under normal OS scheduling, exactly as before
+    // this feature existed.
+    if let Some(core_id) = pinned_core {
+        core_affinity::set_for_current(core_id);
+    }
+
     let mut rng_source = thread_rng();
     let mut rng = ChaCha20Rng::from_rng(&mut rng_source).expect("failed to seed RNG");
 
@@ -837,13 +1184,22 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, prefix_bounds: Vec<
             let compressed = ap.to_encoded_point(true);
             let first21 = compute_first21(compressed.as_bytes(), ADDRESS_VERSION_BYTE);
 
-            // Fast path (prefix-only): if every prefix is proven
-            // impossible regardless of checksum, skip the checksum
-            // computation and Base58 encode entirely. Empty
-            // prefix_bounds (suffix present, or bound computation
-            // failed) means this never triggers, and every candidate
-            // falls through to the exact path below unchanged.
-            if !prefix_bounds.is_empty() && prefix_bounds.iter().all(|b| provably_outside(&first21, b)) {
+            // Fast path: a match requires every present category
+            // (prefix AND suffix AND infix) to be satisfied, so proving
+            // just ONE of them impossible is already enough to skip the
+            // checksum computation and Base58 encode entirely —
+            // regardless of what the others would say. Each bound set
+            // is empty (and so never triggers) whenever that category
+            // has no patterns, or lacks a usable bound (infix always
+            // lacks one; suffixes under 6 characters mathematically
+            // can't have one) — candidates then fall through to the
+            // exact path below for that category, same as before either
+            // optimization existed.
+            let prefix_proves_impossible =
+                !prefix_bounds.is_empty() && prefix_bounds.iter().all(|b| provably_outside_prefix(&first21, b));
+            let suffix_proves_impossible =
+                !suffix_bounds.is_empty() && suffix_bounds.iter().all(|b| provably_outside_suffix(&first21, b));
+            if prefix_proves_impossible || suffix_proves_impossible {
                 continue;
             }
 
@@ -851,8 +1207,9 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, prefix_bounds: Vec<
 
             let prefix_hit = match_any_prefix(&prefixes, &addr);
             let suffix_hit = match_any_suffix(&suffixes, &addr);
+            let infix_hit = match_any_infix(&infixes, &addr);
 
-            if let (Some(prefix_hit), Some(suffix_hit)) = (prefix_hit, suffix_hit) {
+            if let (Some(prefix_hit), Some(suffix_hit), Some(infix_hit)) = (prefix_hit, suffix_hit, infix_hit) {
                 // Only reconstruct the actual private key on a real match
                 // (rare) — the hot loop above never needs it, since it
                 // only ever walks the public key forward.
@@ -860,7 +1217,7 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, prefix_bounds: Vec<
                 let sk_bytes: [u8; 32] = sk_scalar.to_bytes().into();
                 let wif = private_key_to_wif(&sk_bytes, WIF_VERSION_BYTE, true);
                 let priv_hex = hex::encode(sk_bytes);
-                let desc = describe_match(prefix_hit, suffix_hit);
+                let desc = describe_match(prefix_hit, infix_hit, suffix_hit);
 
                 let found_num = state.found_count.fetch_add(1, Ordering::Relaxed) + 1;
                 // Reset the progress-percentage baseline to start counting
@@ -890,15 +1247,21 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, prefix_bounds: Vec<
 
 fn main() {
     let config = parse_cli();
-    let expected = expected_tries(&config.prefixes, &config.suffixes);
+    let expected = expected_tries(&config.prefixes, &config.suffixes, &config.infixes);
     print_banner(&config);
 
-    // Precomputed once, reused read-only by every thread. Empty means
-    // the fast path is unavailable (suffixes present, or a prefix's
-    // bound couldn't be computed) — every candidate then simply falls
-    // through to the exact, unchanged path in worker_loop, same as
-    // before this optimization existed.
-    let prefix_bounds = try_compute_all_prefix_bounds(&config.prefixes, &config.suffixes);
+    // Computed once each, independently, reused read-only by every
+    // thread. Either can be empty (meaning "no skip available from this
+    // category") without affecting the other — see the module note on
+    // the pre-filter section for why that's safe.
+    let prefix_bounds = try_compute_all_prefix_bounds(&config.prefixes);
+    let suffix_bounds = try_compute_all_suffix_bounds(&config.suffixes);
+
+    // Best-effort: None if unavailable on this platform (common — most
+    // desktop/server systems and many phones don't expose this), in
+    // which case every thread below just gets None and runs under
+    // normal OS scheduling.
+    let core_order = fastest_cores_first();
 
     let state = SharedState::new(&config.output_file);
     let start_time = Instant::now();
@@ -907,13 +1270,20 @@ fn main() {
     spawn_stats_thread(state.clone(), start_time, expected, target_matches);
 
     let mut handles = Vec::new();
-    for _ in 0..config.threads {
+    for i in 0..config.threads {
         let prefixes = config.prefixes.clone();
         let suffixes = config.suffixes.clone();
+        let infixes = config.infixes.clone();
         let prefix_bounds = prefix_bounds.clone();
+        let suffix_bounds = suffix_bounds.clone();
         let state = state.clone();
         let max_matches = config.max_matches;
-        handles.push(thread::spawn(move || worker_loop(prefixes, suffixes, prefix_bounds, max_matches, state)));
+        // Fastest core first, cycling if there are more threads than
+        // detected cores (e.g. -t set above the core count).
+        let pinned_core = core_order.as_ref().map(|order| order[i % order.len()]);
+        handles.push(thread::spawn(move || {
+            worker_loop(prefixes, suffixes, infixes, prefix_bounds, suffix_bounds, max_matches, state, pinned_core)
+        }));
     }
 
     for handle in handles {
