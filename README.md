@@ -62,20 +62,10 @@ Options:
 ```
 
 ### Affixes:
-Prefix: `Crypt` (Start)
+Prefix: `Endo` (Start)
 
-Infix: `ograph` (Middle)
+Infix: `morph` (Middle)
 
-Suffix: `y` (End)
+Suffix: `ism` (End)
 
-All: `Cryptography`
-
-verus-vanity v0.2.0 performance achieved 950,000 - 1,250,000 wallets per second (0.95 - 1.25MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) all modes
-
-verus-vanity v0.3.0 performance achieved 2,850,000 - 3,150,000 wallets per second (2.85 - 3.15MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) all modes
-
-verus-vanity v0.3.0a performance achieved 6,500,000 - 8,100,000 wallets per second (6.50 - 8.10MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) --prefix only
-
-verus-vanity v0.4.0 performance achieved 8,880,000 - 10,550,000 wallets per second (8.88 - 10.55MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) --prefix only
-
-verus-vanity v0.5.0 performance achieved 7,000,000 - 8,770,000 wallets per second (8.88 - 10.55MW/s) on a Snapdragon 8 Elite Oryon (2× 4.32 GHz Prime cores + 6× 3.53 GHz Performance cores) --suffix only
+All: `Endomorphism`
