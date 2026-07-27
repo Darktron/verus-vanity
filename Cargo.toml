@@ -1,6 +1,6 @@
 [package]
 name = "verus-vanity"
-version = "0.6.2"
+version = "0.7.2"
 edition = "2021"
 
 [dependencies]
@@ -10,7 +10,7 @@ rand_chacha = "0.3"
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "alloc", "expose-field"] }
 elliptic-curve = "0.13"
 ff = "0.13"
-sha2 = { version = "0.10", features = ["asm-aarch64"] }
+sha2 = { version = "0.10", features = ["compress"] }
 ripemd = "0.1"
 bs58 = "0.5"
 hex = "0.4"
@@ -19,6 +19,29 @@ core_affinity = "0.8"
 qrcode = { version = "0.14", default-features = false }
 zeroize = "=1.7.0"
 base64ct = "=1.6.0"
+
+# sha2's hardware SHA-256 backend is selected differently per target, and
+# getting this wrong costs either speed or portability:
+#
+#   aarch64 — the ARMv8 crypto-extension path is gated behind the `asm`
+#             feature (`cfg(all(feature = "asm", target_arch = "aarch64"))`).
+#             Without it, aarch64 silently falls back to the pure-software
+#             implementation, which is several times slower.
+#
+#   x86_64  — needs nothing here. sha2 always routes through its `x86`
+#             module, which picks SHA-NI when the CPU has it; the `asm`
+#             feature only changes the fallback used when it does not.
+#
+# `asm` pulls in the `sha2-asm` crate, which compiles assembly via a build
+# script and therefore needs a working C compiler. Scoping it to aarch64
+# means every other target builds with pure Rust and no C toolchain, while
+# aarch64 still gets the fast path.
+#
+# (The previous `asm-aarch64` feature is a deprecated alias that just
+# enables `asm` — on ALL targets, so it was imposing the C-compiler
+# requirement everywhere for no x86_64 benefit.)
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
 
 # Aggressive release optimizations — matters a lot for a hot CPU-bound
 # search loop like this one.
