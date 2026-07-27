@@ -14,7 +14,7 @@ pkg update && pkg install rust git
 
 2. Clone the repo:
 ```
-git clone https://github.com/Darktron/verus-vanity.git
+git clone -b test https://github.com/Darktron/verus-vanity.git
 ```
 
 3. Build:
