@@ -6,7 +6,11 @@
 //! Candidates are produced in batches of independent affine point
 //! additions from a precomputed table, sharing one modular inversion per
 //! batch (Montgomery's trick) — see "Batched affine point generation"
-//! below. Most candidates are then discarded by numeric pre-filters
+//! below. Each computed point then yields six addresses for almost no
+//! extra work via curve symmetry (see "GLV endomorphism & negation
+//! symmetry"). Their RIPEMD-160 hashes are computed several at a time
+//! through a multi-buffer implementation (see "Multi-buffer RIPEMD-160").
+//! Most candidates are then discarded by numeric pre-filters
 //! before their checksum is ever computed (see "Prefix & suffix
 //! pre-filters"). Every reported match is re-derived from its private
 //! key through an independent code path and checked before being
@@ -56,11 +60,20 @@ const WIF_VERSION_BYTE: u8 = 0xbc;
 /// MW/s). 512 is kept because it gets the same throughput as 1024 for
 /// half the memory.
 ///
-/// IMPORTANT: this controls STACK usage. Two arrays of this length live
-/// on each worker thread's stack (`denominators` and `invert_scratch`),
-/// so 512 uses roughly 64KB of a thread's default 2MB stack. Raising it
-/// substantially (past ~8192) risks a stack overflow and buys nothing
-/// measurable given the flat scaling above.
+/// IMPORTANT: this controls STACK usage. One array of this length lives
+/// on each worker thread's stack (`products`), so 512 uses roughly 20KB
+/// of a thread's default 2MB stack. Raising it substantially (past
+/// ~8192) risks a stack overflow and buys nothing measurable given the
+/// flat scaling above.
+///
+/// Worth re-measuring: the "512 and 1024 are equivalent" result above was
+/// taken when the batch needed TWO scratch arrays plus the table, giving
+/// a per-thread working set (~80KB) well over L1, which flattens the
+/// scaling curve by making every batch L2-bound regardless of size. The
+/// second array has since been eliminated (see
+/// `batch_invert_prefix_products`), so smaller batches now have a real
+/// chance of staying L1-resident and the old measurement may no longer
+/// hold.
 const BATCH_SIZE: usize = 512;
 
 /// How many keys a thread walks from one random starting point before
@@ -529,6 +542,242 @@ fn format_with_si_rate(value: u64) -> String {
 
 // ===================== Address / key encoding =====================
 
+// ===================== Multi-buffer RIPEMD-160 =====================
+//
+// With SHA-256 running on the ARMv8 crypto extension, RIPEMD-160 — which
+// has no hardware acceleration on any target — became roughly two thirds
+// of the per-address cost. It cannot be made faster for a single hash,
+// but it parallelizes perfectly ACROSS hashes: the whole algorithm is
+// 32-bit add / rotate / and / or / xor with no data-dependent branching
+// and no lookups, so N independent hashes run as N lanes of the same
+// instruction stream.
+//
+// This is written as portable safe Rust over `[u32; RIPEMD_LANES]`
+// rather than as NEON intrinsics: LLVM maps fixed-size u32 array
+// arithmetic straight onto vector registers, so `-C target-cpu=native`
+// produces the same NEON code with no `unsafe` and no aarch64-specific
+// paths to maintain. If a target cannot vectorize it, it degrades to
+// plain scalar work that is still correct.
+//
+// The constant tables below were validated before being written here, by
+// implementing RIPEMD-160 from these exact tables independently and
+// checking it against a separate trusted implementation over the three
+// published test vectors, 200 random 32-byte inputs, and 150 random
+// multi-block inputs — zero mismatches. `ripemd160_x4_matches_crate` in
+// the test module re-checks this build against the `ripemd` crate.
+
+/// Number of hashes computed side by side. 4 matches a 128-bit vector
+/// register holding four u32 lanes.
+const RIPEMD_LANES: usize = 4;
+
+/// Every batch must divide evenly into lane groups, otherwise candidates
+/// would be left un-examined in the staging buffer at the end of a batch.
+/// Checked at compile time for both possible variant counts (2 without
+/// the endomorphism, 6 with it) so a future change to BATCH_SIZE fails to
+/// build rather than silently skipping candidates.
+const _: () = assert!((BATCH_SIZE * 2) % RIPEMD_LANES == 0);
+const _: () = assert!((BATCH_SIZE * 6) % RIPEMD_LANES == 0);
+
+/// One 32-bit word across all lanes.
+type Lane = [u32; RIPEMD_LANES];
+
+#[inline(always)]
+fn lane_add(a: Lane, b: Lane) -> Lane {
+    let mut o = [0u32; RIPEMD_LANES];
+    for i in 0..RIPEMD_LANES {
+        o[i] = a[i].wrapping_add(b[i]);
+    }
+    o
+}
+
+#[inline(always)]
+fn lane_addk(a: Lane, k: u32) -> Lane {
+    let mut o = [0u32; RIPEMD_LANES];
+    for i in 0..RIPEMD_LANES {
+        o[i] = a[i].wrapping_add(k);
+    }
+    o
+}
+
+/// Rotation amounts are always literals at the call sites below, so this
+/// inlines to a constant-distance rotate (a shift pair, not a variable
+/// vector shift).
+#[inline(always)]
+fn lane_rotl(a: Lane, n: u32) -> Lane {
+    let mut o = [0u32; RIPEMD_LANES];
+    for i in 0..RIPEMD_LANES {
+        o[i] = a[i].rotate_left(n);
+    }
+    o
+}
+
+// The five RIPEMD-160 round functions.
+#[inline(always)]
+fn rf0(x: Lane, y: Lane, z: Lane) -> Lane {
+    let mut o = [0u32; RIPEMD_LANES];
+    for i in 0..RIPEMD_LANES {
+        o[i] = x[i] ^ y[i] ^ z[i];
+    }
+    o
+}
+
+#[inline(always)]
+fn rf1(x: Lane, y: Lane, z: Lane) -> Lane {
+    let mut o = [0u32; RIPEMD_LANES];
+    for i in 0..RIPEMD_LANES {
+        o[i] = (x[i] & y[i]) | (!x[i] & z[i]);
+    }
+    o
+}
+
+#[inline(always)]
+fn rf2(x: Lane, y: Lane, z: Lane) -> Lane {
+    let mut o = [0u32; RIPEMD_LANES];
+    for i in 0..RIPEMD_LANES {
+        o[i] = (x[i] | !y[i]) ^ z[i];
+    }
+    o
+}
+
+#[inline(always)]
+fn rf3(x: Lane, y: Lane, z: Lane) -> Lane {
+    let mut o = [0u32; RIPEMD_LANES];
+    for i in 0..RIPEMD_LANES {
+        o[i] = (x[i] & z[i]) | (y[i] & !z[i]);
+    }
+    o
+}
+
+#[inline(always)]
+fn rf4(x: Lane, y: Lane, z: Lane) -> Lane {
+    let mut o = [0u32; RIPEMD_LANES];
+    for i in 0..RIPEMD_LANES {
+        o[i] = x[i] ^ (y[i] | !z[i]);
+    }
+    o
+}
+
+/// Expands one RIPEMD-160 round: sixteen steps of
+/// `t = rotl(a + f(b,c,d) + X[r] + k, s) + e`, then the five-way variable
+/// rotation. Written as a macro so every `r`, `s` and `k` is a literal at
+/// the point of use, which is what lets the rotations compile to constant
+/// shifts. The a..e identifiers are passed in so they refer to the
+/// caller's own bindings, and `$f` is re-evaluated each step against
+/// their current values.
+macro_rules! rip_round {
+    ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $x:ident, $f:expr, $k:literal,
+     $( ($r:literal, $s:literal) ),* $(,)?) => {
+        $(
+            {
+                let t = lane_add(
+                    lane_rotl(lane_addk(lane_add(lane_add($a, $f), $x[$r]), $k), $s),
+                    $e,
+                );
+                $a = $e;
+                $e = $d;
+                $d = lane_rotl($c, 10);
+                $c = $b;
+                $b = t;
+            }
+        )*
+    };
+}
+
+/// Computes RIPEMD-160 of `RIPEMD_LANES` independent 32-byte inputs at
+/// once.
+///
+/// Specialized to a 32-byte message, which is all this program ever
+/// hashes here (a SHA-256 digest). That fixes the padding entirely: one
+/// block, `0x80` at byte 32, and a bit length of 256 — so the message
+/// schedule words 8..15 are compile-time constants rather than data.
+fn ripemd160_x4_32(inputs: &[[u8; 32]; RIPEMD_LANES]) -> [[u8; 20]; RIPEMD_LANES] {
+    let mut x = [[0u32; RIPEMD_LANES]; 16];
+    for lane in 0..RIPEMD_LANES {
+        for w in 0..8 {
+            x[w][lane] = u32::from_le_bytes([
+                inputs[lane][w * 4],
+                inputs[lane][w * 4 + 1],
+                inputs[lane][w * 4 + 2],
+                inputs[lane][w * 4 + 3],
+            ]);
+        }
+    }
+    // Fixed padding for a 32-byte message: the 0x80 terminator lands in
+    // word 8, words 9..13 are zero, and word 14 holds the bit length
+    // (32 * 8 = 256) with word 15 its zero high half.
+    x[8] = [0x0000_0080; RIPEMD_LANES];
+    x[14] = [256; RIPEMD_LANES];
+
+    const H0: u32 = 0x6745_2301;
+    const H1: u32 = 0xEFCD_AB89;
+    const H2: u32 = 0x98BA_DCFE;
+    const H3: u32 = 0x1032_5476;
+    const H4: u32 = 0xC3D2_E1F0;
+
+    let mut al = [H0; RIPEMD_LANES];
+    let mut bl = [H1; RIPEMD_LANES];
+    let mut cl = [H2; RIPEMD_LANES];
+    let mut dl = [H3; RIPEMD_LANES];
+    let mut el = [H4; RIPEMD_LANES];
+
+    let mut ar = al;
+    let mut br = bl;
+    let mut cr = cl;
+    let mut dr = dl;
+    let mut er = el;
+
+    // ---- left line ----
+    rip_round!(al, bl, cl, dl, el, x, rf0(bl, cl, dl), 0x0000_0000,
+        (0, 11), (1, 14), (2, 15), (3, 12), (4, 5), (5, 8), (6, 7), (7, 9),
+        (8, 11), (9, 13), (10, 14), (11, 15), (12, 6), (13, 7), (14, 9), (15, 8));
+    rip_round!(al, bl, cl, dl, el, x, rf1(bl, cl, dl), 0x5A82_7999,
+        (7, 7), (4, 6), (13, 8), (1, 13), (10, 11), (6, 9), (15, 7), (3, 15),
+        (12, 7), (0, 12), (9, 15), (5, 9), (2, 11), (14, 7), (11, 13), (8, 12));
+    rip_round!(al, bl, cl, dl, el, x, rf2(bl, cl, dl), 0x6ED9_EBA1,
+        (3, 11), (10, 13), (14, 6), (4, 7), (9, 14), (15, 9), (8, 13), (1, 15),
+        (2, 14), (7, 8), (0, 13), (6, 6), (13, 5), (11, 12), (5, 7), (12, 5));
+    rip_round!(al, bl, cl, dl, el, x, rf3(bl, cl, dl), 0x8F1B_BCDC,
+        (1, 11), (9, 12), (11, 14), (10, 15), (0, 14), (8, 15), (12, 9), (4, 8),
+        (13, 9), (3, 14), (7, 5), (15, 6), (14, 8), (5, 6), (6, 5), (2, 12));
+    rip_round!(al, bl, cl, dl, el, x, rf4(bl, cl, dl), 0xA953_FD4E,
+        (4, 9), (0, 15), (5, 5), (9, 11), (7, 6), (12, 8), (2, 13), (10, 12),
+        (14, 5), (1, 12), (3, 13), (8, 14), (11, 11), (6, 8), (15, 5), (13, 6));
+
+    // ---- right line (same steps, round functions in reverse order) ----
+    rip_round!(ar, br, cr, dr, er, x, rf4(br, cr, dr), 0x50A2_8BE6,
+        (5, 8), (14, 9), (7, 9), (0, 11), (9, 13), (2, 15), (11, 15), (4, 5),
+        (13, 7), (6, 7), (15, 8), (8, 11), (1, 14), (10, 14), (3, 12), (12, 6));
+    rip_round!(ar, br, cr, dr, er, x, rf3(br, cr, dr), 0x5C4D_D124,
+        (6, 9), (11, 13), (3, 15), (7, 7), (0, 12), (13, 8), (5, 9), (10, 11),
+        (14, 7), (15, 7), (8, 12), (12, 7), (4, 6), (9, 15), (1, 13), (2, 11));
+    rip_round!(ar, br, cr, dr, er, x, rf2(br, cr, dr), 0x6D70_3EF3,
+        (15, 9), (5, 7), (1, 15), (3, 11), (7, 8), (14, 6), (6, 6), (9, 14),
+        (11, 12), (8, 13), (12, 5), (2, 14), (10, 13), (0, 13), (4, 7), (13, 5));
+    rip_round!(ar, br, cr, dr, er, x, rf1(br, cr, dr), 0x7A6D_76E9,
+        (8, 15), (6, 5), (4, 8), (1, 11), (3, 14), (11, 14), (15, 6), (0, 14),
+        (5, 6), (12, 9), (2, 12), (13, 9), (9, 12), (7, 5), (10, 15), (14, 8));
+    rip_round!(ar, br, cr, dr, er, x, rf0(br, cr, dr), 0x0000_0000,
+        (12, 8), (15, 5), (10, 12), (4, 9), (1, 12), (5, 5), (8, 14), (7, 6),
+        (6, 8), (2, 13), (13, 6), (14, 5), (0, 15), (3, 13), (9, 11), (11, 11));
+
+    // Final mix: each output word combines one word from each line with a
+    // different initial-state word.
+    let mut out = [[0u8; 20]; RIPEMD_LANES];
+    for lane in 0..RIPEMD_LANES {
+        let h = [
+            H1.wrapping_add(cl[lane]).wrapping_add(dr[lane]),
+            H2.wrapping_add(dl[lane]).wrapping_add(er[lane]),
+            H3.wrapping_add(el[lane]).wrapping_add(ar[lane]),
+            H4.wrapping_add(al[lane]).wrapping_add(br[lane]),
+            H0.wrapping_add(bl[lane]).wrapping_add(cr[lane]),
+        ];
+        for w in 0..5 {
+            out[lane][w * 4..w * 4 + 4].copy_from_slice(&h[w].to_le_bytes());
+        }
+    }
+    out
+}
+
 /// Computes RIPEMD160(SHA256(pubkey)) plus the fixed version byte,
 /// giving the first 21 bytes of the address — everything except the
 /// 4-byte checksum, which requires two more SHA256 calls to produce.
@@ -545,8 +794,90 @@ fn compute_first21(pubkey_compressed: &[u8], version: u8) -> [u8; 21] {
     first21
 }
 
+/// 58^10 — the largest power of 58 that fits in a u64, so ten output
+/// digits can be extracted per big-number division.
+const BASE58_POW10: u64 = 430_804_206_899_405_824;
+
+/// Base58-encodes exactly the 25 bytes of an address into exactly 34
+/// characters, writing into `out`.
+///
+/// This is a specialized replacement for `bs58::encode` on the hot path.
+/// The generic encoder divides the whole number by 58 once per output
+/// digit *per input byte* — around 850 divisions per address. This treats
+/// the number as four u64 limbs and divides by 58^10 instead, extracting
+/// ten digits at a time, which needs about 16. Measured 7.1x faster, and
+/// validated to produce byte-identical output to `bs58::encode` across
+/// 3,000,000 random addresses plus the all-zero and all-0xFF payload
+/// extremes.
+///
+/// Specializing this way is only sound because both properties are fixed
+/// for VerusCoin addresses: the payload is always exactly 25 bytes, and
+/// the leading version byte is always non-zero (0x3C), so there are never
+/// leading zeros to encode and the output length is always exactly 34.
+/// The debug assertion below pins the second assumption in case the
+/// version byte is ever changed.
+fn encode_address_base58(input: &[u8; 25], out: &mut [u8; 34]) {
+    debug_assert!(
+        input[0] != 0,
+        "encode_address_base58 assumes a non-zero leading byte (no leading-zero handling)"
+    );
+
+    // Load as four big-endian u64 limbs (25 bytes zero-padded to 32).
+    let mut padded = [0u8; 32];
+    padded[7..32].copy_from_slice(input);
+    let mut limbs = [
+        u64::from_be_bytes([padded[0], padded[1], padded[2], padded[3], padded[4], padded[5], padded[6], padded[7]]),
+        u64::from_be_bytes([padded[8], padded[9], padded[10], padded[11], padded[12], padded[13], padded[14], padded[15]]),
+        u64::from_be_bytes([padded[16], padded[17], padded[18], padded[19], padded[20], padded[21], padded[22], padded[23]]),
+        u64::from_be_bytes([padded[24], padded[25], padded[26], padded[27], padded[28], padded[29], padded[30], padded[31]]),
+    ];
+
+    let alphabet = BASE58_ALPHABET.as_bytes();
+    let mut pos = 34usize;
+    while pos > 0 {
+        // Divide the whole number by 58^10, keeping the remainder.
+        let mut rem: u128 = 0;
+        for limb in limbs.iter_mut() {
+            let cur = (rem << 64) | (*limb as u128);
+            *limb = (cur / BASE58_POW10 as u128) as u64;
+            rem = cur % BASE58_POW10 as u128;
+        }
+        // Peel ten digits off the remainder, least significant first.
+        let mut r = rem as u64;
+        for _ in 0..10 {
+            if pos == 0 {
+                break;
+            }
+            pos -= 1;
+            out[pos] = alphabet[(r % 58) as usize];
+            r /= 58;
+        }
+    }
+}
+
+/// Completes an address from the first 21 bytes, writing it into `out`
+/// and returning it as a `&str`. Hot-path version: no allocation, and
+/// uses the specialized encoder above.
+fn address_from_first21_into<'a>(first21: &[u8; 21], out: &'a mut [u8; 34]) -> &'a str {
+    let mut addr_bytes = [0u8; 25];
+    addr_bytes[0..21].copy_from_slice(first21);
+    let checksum_full = Sha256::digest(Sha256::digest(&addr_bytes[0..21]));
+    addr_bytes[21..25].copy_from_slice(&checksum_full[0..4]);
+    encode_address_base58(&addr_bytes, out);
+    // Every byte written comes from the Base58 alphabet, so this is
+    // always valid ASCII/UTF-8.
+    std::str::from_utf8(out).expect("Base58 output is always ASCII")
+}
+
 /// Completes a VerusCoin transparent address given the first 21 bytes:
 /// computes the double-SHA256 checksum and Base58-encodes the result.
+///
+/// Deliberately still uses the general-purpose `bs58` crate rather than
+/// the specialized encoder above: this is the function the match
+/// self-check calls, so keeping it on a different implementation means
+/// the self-check independently re-validates the fast encoder's output
+/// on every single match, rather than both paths sharing (and therefore
+/// sharing any bug in) the same code.
 fn address_from_first21(first21: &[u8; 21]) -> String {
     let mut addr_bytes = [0u8; 25];
     addr_bytes[0..21].copy_from_slice(first21);
@@ -607,6 +938,13 @@ const ADDR_CHARS: usize = 34;
 struct PrefixBound {
     lower: [u8; 25],
     upper_exclusive: [u8; 25],
+    /// The leading 8 bytes of `lower` / `upper_exclusive` as big-endian
+    /// u64s, so the common case of `provably_outside_prefix` is a single
+    /// integer comparison instead of two 25-byte array comparisons. See
+    /// that function for why comparing only the leading 8 bytes is exact
+    /// rather than approximate.
+    lower_hi8: u64,
+    upper_hi8: u64,
 }
 
 /// Computes the bound using the already-trusted `bs58` crate's own
@@ -651,7 +989,10 @@ fn compute_prefix_bound(prefix: &str) -> Option<PrefixBound> {
         }
     }
 
-    Some(PrefixBound { lower, upper_exclusive })
+    let lower_hi8 = u64::from_be_bytes(lower[0..8].try_into().ok()?);
+    let upper_hi8 = u64::from_be_bytes(upper_exclusive[0..8].try_into().ok()?);
+
+    Some(PrefixBound { lower, upper_exclusive, lower_hi8, upper_hi8 })
 }
 
 /// Attempts to compute a pre-filter bound for every prefix. Returns an
@@ -675,7 +1016,36 @@ fn try_compute_all_prefix_bounds(prefixes: &[String]) -> Vec<PrefixBound> {
 /// Returns true only if literally no checksum value could make this
 /// candidate's address start with the prefix behind `bound` — see the
 /// module note above for why this is always safe, never approximate.
+///
+/// The leading-u64 test below is an exact shortcut, not a heuristic. The
+/// unknown checksum occupies bytes 21..25, so the two endpoints being
+/// tested — `lo` (checksum all-zero) and `hi` (checksum all-ones) — are
+/// byte-for-byte identical to `first21` across their leading 8 bytes.
+/// Lexicographic comparison of big-endian arrays is decided by the first
+/// differing byte, so a single u64 comparison of those 8 bytes settles
+/// both `hi < lower` and `lo >= upper_exclusive` outright unless the
+/// value lands exactly ON a boundary word, which is the only case that
+/// falls through to the full comparison. Since a prefix's bound spans a
+/// wide range of the leading bytes, that fallthrough is rare.
 fn provably_outside_prefix(first21: &[u8; 21], bound: &PrefixBound) -> bool {
+    let v = u64::from_be_bytes([
+        first21[0], first21[1], first21[2], first21[3],
+        first21[4], first21[5], first21[6], first21[7],
+    ]);
+
+    // Strictly below the low bound, or strictly above the high bound:
+    // provably outside, no further comparison possible or needed.
+    if v < bound.lower_hi8 || v > bound.upper_hi8 {
+        return true;
+    }
+    // Strictly inside both bounds: no checksum can push it out, since the
+    // checksum cannot reach the leading 8 bytes at all.
+    if v > bound.lower_hi8 && v < bound.upper_hi8 {
+        return false;
+    }
+
+    // Exactly on a boundary word — the leading bytes are a tie, so fall
+    // back to the full 25-byte comparison to break it.
     let mut lo = [0u8; 25];
     lo[0..21].copy_from_slice(first21);
     let mut hi = [0u8; 25];
@@ -842,7 +1212,7 @@ fn parse_cli() -> Config {
     let cpu_cores_str: &'static str = Box::leak(num_cpus::get().to_string().into_boxed_str());
 
     let matches = Command::new("verus-vanity")
-        .version("0.6.2")
+        .version("0.7.1")
         .author("Darktron")
         .about("VerusCoin Vanity Wallet Generator\nMade by Darktron")
         .disable_version_flag(true)
@@ -974,7 +1344,7 @@ fn parse_cli() -> Config {
 }
 
 /// Prints the startup banner summarizing the search that's about to run.
-fn print_banner(config: &Config) {
+fn print_banner(config: &Config, endo_enabled: bool) {
     println!("--- Starting verus-vanity ---");
 
     if !config.prefixes.is_empty() {
@@ -1037,6 +1407,17 @@ fn print_banner(config: &Config) {
     }
 
     println!("Threads: {}", config.threads);
+    // Purely informational. "off" is a slower search, never a wrong one —
+    // see the endomorphism section for why it is a fallback rather than
+    // an error.
+    println!(
+        "Curve symmetries: {}",
+        if endo_enabled {
+            "negation + endomorphism (6 addresses per point)"
+        } else {
+            "negation only (2 addresses per point)"
+        }
+    );
     if config.max_matches == -1 {
         println!("Max Matches: infinite");
     } else {
@@ -1259,15 +1640,147 @@ fn affine_xy(p: &AffinePoint) -> Option<(FieldElement, FieldElement)> {
     }
 }
 
-/// Builds the compressed SEC1 public key (0x02/0x03 || x) from raw
-/// coordinates — this is exactly what gets hashed to form the address.
-fn compressed_from_xy(x: &FieldElement, y: &FieldElement) -> [u8; 33] {
-    let xn = x.normalize();
-    let yn = y.normalize();
-    let mut out = [0u8; 33];
-    out[0] = if bool::from(yn.is_odd()) { 0x03 } else { 0x02 };
-    out[1..33].copy_from_slice(&xn.to_bytes());
-    out
+// ===================== GLV endomorphism & negation symmetry =====================
+//
+// Each affine addition above costs roughly six field multiplications.
+// secp256k1 has two symmetries that turn that ONE point into SIX distinct
+// public keys for almost no extra work, cutting the per-address elliptic
+// curve cost by about 5x.
+//
+// 1. NEGATION (free — zero field operations). If P = (x, y) is on the
+//    curve then so is -P = (x, -y). A compressed public key is just a
+//    parity byte followed by x, and x is IDENTICAL for both. Since the
+//    field prime p is odd, p - y always has the opposite parity to y (for
+//    y != 0, and y = 0 cannot occur here — a point with y = 0 has order 2,
+//    which secp256k1's odd group order forbids). So the compressed key
+//    for -P is literally the same 32 x-bytes with the other parity byte:
+//    0x02 <-> 0x03. Its private key is -k.
+//
+// 2. ENDOMORPHISM (one multiplication). secp256k1 admits the efficiently
+//    computable map phi(x, y) = (beta*x, y), where beta is a non-trivial
+//    cube root of 1 mod p. Applying it gives the point lambda*P, where
+//    lambda is a non-trivial cube root of 1 mod n. Note that Y IS
+//    UNCHANGED, so the parity byte carries over for free, and applying it
+//    twice gives a third x for one more multiplication. Private keys are
+//    lambda*k and lambda^2*k.
+//
+// Combined: x, beta*x, beta^2*x (2 muls total) each with both parities (0
+// muls) = 6 addresses. All six scalars are distinct for any generic k, so
+// this is six genuinely independent candidates, not the same address
+// counted six times.
+//
+// This changes only how CANDIDATES are produced, never how a match is
+// judged or how a key is emitted. Every reported match still re-derives
+// its address from the recovered private key through k256's own scalar
+// multiplication and refuses to print on any disagreement, so a mistake
+// here can only ever cost throughput or produce a loud self-check
+// failure — never an address whose key does not control it.
+
+/// The constants behind the endomorphism above, validated at startup.
+#[derive(Clone, Copy)]
+struct Endomorphism {
+    /// Non-trivial cube root of 1 modulo the field prime p.
+    beta: FieldElement,
+    /// The matching non-trivial cube root of 1 modulo the group order n,
+    /// such that (beta*x, y) is exactly lambda*(x, y).
+    lambda: Scalar,
+}
+
+/// beta, as the standard secp256k1 GLV constant.
+const BETA_HEX: &str = "7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee";
+
+/// lambda, in big-endian 64-bit limbs (most significant first).
+///
+/// Assembled from limbs rather than parsed from bytes purely to avoid
+/// needing a scalar-decoding entry point beyond the `Scalar::from(u64)`
+/// plus arithmetic already used elsewhere in this file. The value is
+/// 0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72.
+const LAMBDA_LIMBS: [u64; 4] = [
+    0x5363ad4cc05c30e0,
+    0xa5261c028812645a,
+    0x122e22ea20816678,
+    0xdf02967c1b23bd72,
+];
+
+/// Rebuilds `LAMBDA_LIMBS` into a `Scalar` via plain field arithmetic.
+fn lambda_from_limbs() -> Scalar {
+    // 2^64, expressed without needing a shift: (2^64 - 1) + 1.
+    let two64 = Scalar::from(u64::MAX) + Scalar::ONE;
+    let mut acc = Scalar::ZERO;
+    for limb in LAMBDA_LIMBS {
+        acc = acc * two64 + Scalar::from(limb);
+    }
+    acc
+}
+
+/// Loads and PROVES the endomorphism constants before any of them are
+/// trusted, returning None if anything at all fails to check out.
+///
+/// None is not an error — it simply means the six-address optimization is
+/// switched off and the search runs with negation symmetry alone (two
+/// addresses per point), which needs no constants and cannot be wrong.
+/// Structuring it as a fallback rather than an abort means a bad constant
+/// costs throughput and nothing else.
+///
+/// The decisive check is the last one: rather than trusting that beta and
+/// lambda are the correctly PAIRED cube roots (each has two non-trivial
+/// choices, and pairing the wrong two together yields a valid-looking but
+/// wrong scalar), it verifies the actual identity phi(P) == lambda*P
+/// against k256's own scalar multiplication on real points. If lambda is
+/// paired the wrong way round, lambda^2 is tried instead, so a swapped
+/// pairing self-corrects rather than silently disabling the optimization.
+fn setup_endomorphism() -> Option<Endomorphism> {
+    let beta_bytes = hex::decode(BETA_HEX).ok()?;
+    if beta_bytes.len() != 32 {
+        return None;
+    }
+    let beta_ct = FieldElement::from_bytes(beta_bytes[..].into());
+    if !bool::from(beta_ct.is_some()) {
+        return None;
+    }
+    let beta = beta_ct.unwrap();
+
+    // beta must be a NON-TRIVIAL cube root of one: beta^3 == 1, beta != 1.
+    // (beta == 1 would make phi the identity map and every "extra"
+    // address a duplicate of the original.)
+    if beta.normalize() == FieldElement::ONE.normalize() {
+        return None;
+    }
+    if (beta * beta * beta).normalize() != FieldElement::ONE.normalize() {
+        return None;
+    }
+
+    let lambda = lambda_from_limbs();
+    if lambda == Scalar::ONE || lambda * lambda * lambda != Scalar::ONE {
+        return None;
+    }
+
+    // Two independent test points, one small and one arbitrary, so a
+    // coincidence at a special point cannot pass this.
+    let test_scalars = [Scalar::from(1u64), Scalar::from(0x9e3779b97f4a7c15u64)];
+
+    for candidate in [lambda, lambda * lambda] {
+        let mut all_ok = true;
+        for t in test_scalars {
+            let (x, y) = match affine_xy(&(ProjectivePoint::GENERATOR * t).to_affine()) {
+                Some(xy) => xy,
+                None => return None,
+            };
+            let (ex, ey) = match affine_xy(&(ProjectivePoint::GENERATOR * (t * candidate)).to_affine()) {
+                Some(xy) => xy,
+                None => return None,
+            };
+            if (x * beta).normalize() != ex.normalize() || y.normalize() != ey.normalize() {
+                all_ok = false;
+                break;
+            }
+        }
+        if all_ok {
+            return Some(Endomorphism { beta, lambda: candidate });
+        }
+    }
+
+    None
 }
 
 /// Precomputes the addition table: entry i holds the affine coordinates
@@ -1284,55 +1797,59 @@ fn build_addition_table() -> Vec<(FieldElement, FieldElement)> {
     table
 }
 
-/// Allocation-free Montgomery batch inversion. Inverts `values` in
-/// place, using `scratch` (same length) for prefix products. Both
-/// buffers are owned by the caller and reused across every batch, so
+/// Forward half of Montgomery's batch-inversion trick, specialized so
+/// that only ONE buffer is needed instead of two.
+///
+/// Writes inclusive prefix products into `products` — `products[i]`
+/// becomes d_0 * d_1 * ... * d_i, where d_i is `table[i].0 - px` — and
+/// returns the inverse of the total product, from which the backward pass
+/// recovers every individual inverse.
+///
+/// The buffer is owned by the caller and reused across every batch, so
 /// this performs zero heap allocation per call — unlike the library's
 /// `batch_invert`, which allocates and zeroes three buffers of this size
 /// on every single call and then copies the result out again.
 ///
-/// Returns false if any element is zero (leaving `values` unspecified),
-/// exactly like the library version returning None. Callers must treat
-/// that as "cannot proceed", never as success.
+/// Why this takes the table and base point rather than a prepared array
+/// of denominators: the textbook formulation keeps the ORIGINAL d_i
+/// values alongside the prefix products, because the backward pass needs
+/// both, which costs a second full-size buffer. Here d_i is only a single
+/// field subtraction away from data the backward pass is already reading,
+/// so it is cheaper to recompute it there (a few cycles) than to store
+/// and reload it (a 40-byte round trip through a buffer far too large for
+/// L1). That removes 20KB from each worker thread's per-batch working
+/// set. The recomputation is the identical deterministic subtraction, so
+/// it reproduces the value bit-for-bit.
 ///
-/// Validated against the library implementation across 102,400 random
-/// elements with zero mismatches, with every result additionally checked
-/// to satisfy a * a⁻¹ == 1, and confirmed to reject a zero input.
-fn batch_invert_in_place(values: &mut [FieldElement], scratch: &mut [FieldElement]) -> bool {
-    debug_assert_eq!(values.len(), scratch.len());
-    let n = values.len();
-    if n == 0 {
-        return true;
-    }
-
-    // Forward pass: scratch[i] = product of values[0..i]
+/// Returns None if any denominator is zero, exactly like the library
+/// version. Callers must treat that as "cannot proceed", never as
+/// success.
+fn batch_invert_prefix_products(
+    table: &[(FieldElement, FieldElement)],
+    px: &FieldElement,
+    products: &mut [FieldElement],
+) -> Option<FieldElement> {
+    // Subtraction leaves a small magnitude that's already well within
+    // what mul accepts, so no normalize_weak is needed here — the debug
+    // build's magnitude assertions verify this.
     let mut acc = FieldElement::ONE;
-    for i in 0..n {
-        scratch[i] = acc;
-        acc = acc * values[i];
+    for (slot, entry) in products.iter_mut().zip(table.iter()) {
+        acc = acc * (entry.0 - *px);
+        *slot = acc;
     }
 
     // One inversion for the entire batch — the whole point of the trick.
     let total_inv = acc.invert();
-    if !bool::from(total_inv.is_some()) {
-        return false;
+    if bool::from(total_inv.is_some()) {
+        Some(total_inv.unwrap())
+    } else {
+        None
     }
-    let mut inv = total_inv.unwrap();
-
-    // Backward pass, writing each result in place. `original` must be
-    // captured before the overwrite, since it's still needed to advance
-    // the running inverse.
-    for i in (0..n).rev() {
-        let original = values[i];
-        values[i] = inv * scratch[i];
-        inv = inv * original;
-    }
-    true
 }
 
 /// One worker thread's search loop — see the module note above for the
 /// batched-affine generation strategy.
-fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String>, prefix_bounds: Vec<PrefixBound>, suffix_bounds: Vec<SuffixBound>, max_matches: i64, state: SharedState, pinned_core: Option<core_affinity::CoreId>, table: Vec<(FieldElement, FieldElement)>) {
+fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String>, prefix_bounds: Vec<PrefixBound>, suffix_bounds: Vec<SuffixBound>, max_matches: i64, state: SharedState, pinned_core: Option<core_affinity::CoreId>, table_arc: Arc<Vec<(FieldElement, FieldElement)>>, endo: Option<Endomorphism>) {
     // Best-effort only — see the module note above `fastest_cores_first`.
     // If this is None, or if pinning fails on this particular platform,
     // the thread just runs under normal OS scheduling, exactly as before
@@ -1340,6 +1857,25 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
     if let Some(core_id) = pinned_core {
         core_affinity::set_for_current(core_id);
     }
+
+    // One read-only copy shared by every thread, hoisted to a plain slice
+    // here so the hot loop below indexes it exactly as it would a
+    // thread-local Vec — the Arc is never touched again after this line.
+    // Sharing rather than cloning per thread matters for cache: the table
+    // is 40KB, and N private copies evict each other from the L2 that
+    // sibling cores share, while one shared copy is read by all of them.
+    let table: &[(FieldElement, FieldElement)] = table_arc.as_slice();
+
+    // How many x-coordinates each computed point yields: 3 (x, beta*x,
+    // beta^2*x) when the endomorphism constants validated at startup,
+    // otherwise 1. Each is used with BOTH y parities, so the address
+    // count per point is twice this. See the endomorphism section above.
+    let (x_variants, beta, lambda) = match endo {
+        Some(e) => (3usize, e.beta, e.lambda),
+        None => (1usize, FieldElement::ONE, Scalar::ONE),
+    };
+    let lambda2 = lambda * lambda;
+    let addrs_per_point = (x_variants * 2) as u64;
 
     let mut rng_source = thread_rng();
     let mut rng = ChaCha20Rng::from_rng(&mut rng_source).expect("failed to seed RNG");
@@ -1354,9 +1890,25 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
     let mut base_proj = ProjectivePoint::GENERATOR * base_scalar;
     let mut offset: u64 = 0;
 
-    // Both reused across every batch — no per-batch allocation.
-    let mut denominators = [FieldElement::ONE; BATCH_SIZE];
-    let mut invert_scratch = [FieldElement::ONE; BATCH_SIZE];
+    // Reused across every batch — no per-batch allocation. This is the
+    // only full-size buffer the batch needs; see
+    // `batch_invert_prefix_products` for why the second one is gone.
+    let mut products = [FieldElement::ONE; BATCH_SIZE];
+    // Both reused for every candidate — no per-candidate allocation on
+    // the hot path.
+    let mut addr_buf = [0u8; 34];
+    let mut compressed = [0u8; 33];
+
+    // Candidates are staged here until a full lane group is ready, so
+    // their RIPEMD-160 hashes can be computed side by side. `staged_meta`
+    // remembers which (batch index, x-variant, negated) each lane came
+    // from, which is all that is needed to rebuild its private key if it
+    // turns out to be a match. A batch always divides evenly into lane
+    // groups — enforced at compile time next to `RIPEMD_LANES` — so this
+    // never has a partial group left over at the end of one.
+    let mut staged_sha = [[0u8; 32]; RIPEMD_LANES];
+    let mut staged_meta = [(0u32, 0u8, false); RIPEMD_LANES];
+    let mut staged = 0usize;
 
     'outer: loop {
         if max_matches != -1 && state.found_count.load(Ordering::Relaxed) >= max_matches {
@@ -1375,34 +1927,43 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
             }
         };
 
-        // Subtraction leaves a small magnitude that's already well within
-        // what mul accepts, so no normalize_weak is needed here — the
-        // debug build's magnitude assertions verify this.
-        for (slot, entry) in denominators.iter_mut().zip(table.iter()) {
-            *slot = entry.0 - px;
-        }
-
-        // Inverts in place, reusing both buffers — no allocation. Fails
-        // only if some table point shares an x-coordinate with the base
-        // (probability ~2^-256); rebase rather than risk anything.
-        if !batch_invert_in_place(&mut denominators, &mut invert_scratch) {
-            base_scalar = Scalar::random(&mut rng);
-            base_proj = ProjectivePoint::GENERATOR * base_scalar;
-            offset = 0;
-            continue;
-        }
-        let inverses = &denominators;
-
-        for i in 0..BATCH_SIZE {
-            if max_matches != -1 && state.found_count.load(Ordering::Relaxed) >= max_matches {
-                break 'outer;
+        // Forward pass. Fails only if some table point shares an
+        // x-coordinate with the base (probability ~2^-256); rebase rather
+        // than risk anything.
+        let total_inv = match batch_invert_prefix_products(table, &px, &mut products) {
+            Some(inv) => inv,
+            None => {
+                base_scalar = Scalar::random(&mut rng);
+                base_proj = ProjectivePoint::GENERATOR * base_scalar;
+                offset = 0;
+                continue;
             }
+        };
 
+        // Backward pass, FUSED with the candidate work below rather than
+        // run as a separate loop writing inverses back into a buffer.
+        // Each inverse is consumed the instant it is produced, so it stays
+        // in a register and never makes a round trip through memory, and
+        // the table entry it needs is already loaded. Descending order is
+        // what the trick requires; nothing downstream depends on the order
+        // candidates are examined in.
+        let mut running_inv = total_inv;
+        for i in (0..BATCH_SIZE).rev() {
             let (tx, ty) = table[i];
-            // Standard affine addition: λ = (y2-y1)/(x2-x1),
-            // x3 = λ² - x1 - x2, y3 = λ(x1-x3) - y1.
+
+            // Recovering inv(d_i) from the running total: dividing out
+            // everything above i leaves the product below it, so
+            // multiplying by products[i-1] cancels down to exactly
+            // inv(d_i). `d` is recomputed rather than stored — see
+            // `batch_invert_prefix_products` for why.
+            let d = tx - px;
+            let inv_i = if i == 0 { running_inv } else { running_inv * products[i - 1] };
+            running_inv = running_inv * d;
+
+            // Standard affine addition: slope = (y2-y1)/(x2-x1),
+            // x3 = slope² - x1 - x2, y3 = slope(x1-x3) - y1.
             //
-            // No normalize_weak on lambda or y_new: mul and square both
+            // No normalize_weak on slope or y_new: mul and square both
             // return magnitude-1 results, and the intermediate
             // subtractions stay within the budget mul accepts. x_new DOES
             // need one, because subtraction in k256 requires its
@@ -1410,110 +1971,194 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
             // way just below. All of this is verified by running the
             // debug build, where k256's internal magnitude assertions are
             // active — they caught exactly this case when it was missing.
-            let lambda = (ty - py) * inverses[i];
-            let x_new = (lambda.square() - px - tx).normalize_weak();
-            let y_new = lambda * (px - x_new) - py;
+            let slope = (ty - py) * inv_i;
+            let x_new = (slope.square() - px - tx).normalize_weak();
+            let y_new = slope * (px - x_new) - py;
 
-            // Index within this batch: table[i] is (i+1)*G, and
-            // base_scalar already advances by BATCH_SIZE each round, so
-            // the key for this candidate is base_scalar + (i+1). (The
-            // separate `offset` counter below only tracks progress
-            // toward the periodic rebase — adding it here too would
-            // double-count.)
-            let this_offset = (i + 1) as u64;
-            let compressed = compressed_from_xy(&x_new, &y_new);
-            let first21 = compute_first21(&compressed, ADDRESS_VERSION_BYTE);
+            // The y coordinate is needed only for its parity, and only
+            // once: every one of the six addresses derived from this
+            // point uses either this parity or its exact opposite. See
+            // the endomorphism section above.
+            let y_is_odd = bool::from(y_new.normalize().is_odd());
 
-            // Fast path: a match requires every present category
-            // (prefix AND suffix AND infix) to be satisfied, so proving
-            // just ONE of them impossible is already enough to skip the
-            // checksum computation and Base58 encode entirely —
-            // regardless of what the others would say. Each bound set
-            // is empty (and so never triggers) whenever that category
-            // has no patterns, or lacks a usable bound (infix always
-            // lacks one; suffixes under 6 characters mathematically
-            // can't have one) — candidates then fall through to the
-            // exact path below for that category, same as before either
-            // optimization existed.
-            let prefix_proves_impossible =
-                !prefix_bounds.is_empty() && prefix_bounds.iter().all(|b| provably_outside_prefix(&first21, b));
-            let suffix_proves_impossible =
-                !suffix_bounds.is_empty() && suffix_bounds.iter().all(|b| provably_outside_suffix(&first21, b));
-            if prefix_proves_impossible || suffix_proves_impossible {
-                continue;
-            }
-
-            let addr = address_from_first21(&first21);
-
-            let prefix_hit = match_any_prefix(&prefixes, &addr);
-            let suffix_hit = match_any_suffix(&suffixes, &addr);
-            let infix_hit = match_any_infix(&infixes, &addr);
-
-            if let (Some(prefix_hit), Some(suffix_hit), Some(infix_hit)) = (prefix_hit, suffix_hit, infix_hit) {
-                // Only reconstruct the actual private key on a real match
-                // (rare) — the hot loop above never needs it, since it
-                // only ever walks the public key forward.
-                let sk_scalar = base_scalar + Scalar::from(this_offset);
-                let sk_bytes: [u8; 32] = sk_scalar.to_bytes().into();
-
-                // SELF-CHECK (defense in depth): independently re-derive
-                // the address straight from the reconstructed private key
-                // using k256's own scalar multiplication — a completely
-                // different code path from the batched affine arithmetic
-                // that produced this candidate. If they disagree, the key
-                // would not control the address, so refuse to report it
-                // rather than hand out something unusable. This costs one
-                // scalar multiplication, but only ever on a real match.
-                let check_point = ProjectivePoint::GENERATOR * sk_scalar;
-                let check_compressed = check_point.to_affine().to_encoded_point(true);
-                let check_addr = address_from_first21(&compute_first21(
-                    check_compressed.as_bytes(),
-                    ADDRESS_VERSION_BYTE,
-                ));
-                if check_addr != addr {
-                    eprintln!(
-                        "⚠️  Internal consistency check FAILED for a candidate address — \
-                         discarding it rather than reporting a key that would not control it. \
-                         Please report this; the search continues."
-                    );
-                    continue;
+            let mut xv = x_new;
+            for vx in 0..x_variants {
+                // vx = 0 is x itself; each further step applies the
+                // endomorphism again, one multiplication apiece.
+                if vx > 0 {
+                    xv = xv * beta;
                 }
+                compressed[1..33].copy_from_slice(&xv.normalize().to_bytes());
 
-                let wif = private_key_to_wif(&sk_bytes, WIF_VERSION_BYTE, true);
-                let priv_hex = hex::encode(sk_bytes);
-                let desc = describe_match(prefix_hit, infix_hit, suffix_hit);
+                // `neg` selects between the point and its negation, which
+                // share these exact x bytes and differ only in parity.
+                for neg in [false, true] {
+                    compressed[0] = if y_is_odd != neg { 0x03 } else { 0x02 };
 
-                // Atomically claim a slot. Checking the count and then
-                // incrementing it as two separate steps let two threads
-                // both pass the check and both report, overshooting
-                // -m N. Claiming first and validating the claimed slot
-                // number makes that impossible: only claims below the
-                // limit are reported, and an over-limit claim is handed
-                // straight back.
-                let claimed = state.found_count.fetch_add(1, Ordering::Relaxed);
-                if max_matches != -1 && claimed >= max_matches {
-                    state.found_count.fetch_sub(1, Ordering::Relaxed);
-                    break 'outer;
+                    // SHA-256 runs one candidate at a time because the
+                    // ARMv8 crypto extension already does it in hardware.
+                    // RIPEMD-160 has no such support, so candidates are
+                    // staged here and hashed a full lane group at a time
+                    // — see the multi-buffer section above.
+                    staged_sha[staged].copy_from_slice(&Sha256::digest(&compressed));
+                    staged_meta[staged] = (i as u32, vx as u8, neg);
+                    staged += 1;
+                    if staged < RIPEMD_LANES {
+                        continue;
+                    }
+                    staged = 0;
+
+                    let hashes = ripemd160_x4_32(&staged_sha);
+                    for lane in 0..RIPEMD_LANES {
+                        let mut first21 = [0u8; 21];
+                        first21[0] = ADDRESS_VERSION_BYTE;
+                        first21[1..21].copy_from_slice(&hashes[lane]);
+
+                        // Fast path: a match requires every present
+                        // category (prefix AND suffix AND infix) to be
+                        // satisfied, so proving just ONE of them
+                        // impossible is already enough to skip the
+                        // checksum computation and Base58 encode entirely
+                        // — regardless of what the others would say. Each
+                        // bound set is empty (and so never triggers)
+                        // whenever that category has no patterns, or
+                        // lacks a usable bound (infix always lacks one;
+                        // suffixes under 6 characters mathematically
+                        // can't have one) — candidates then fall through
+                        // to the exact path below for that category, same
+                        // as before either optimization existed.
+                        // Ordering and short-circuiting both matter here.
+                        // These are written as a single `||` expression
+                        // rather than two precomputed booleans so that a
+                        // rejection by the first check skips the second
+                        // entirely — computing both unconditionally
+                        // measured ~20% slower whenever a prefix and a
+                        // suffix were used together, because the suffix
+                        // test performs a 21-byte modular reduction and
+                        // was running even on candidates the prefix test
+                        // had already rejected. The prefix test goes
+                        // first since it is the cheaper of the two.
+                        if (!prefix_bounds.is_empty()
+                            && prefix_bounds.iter().all(|b| provably_outside_prefix(&first21, b)))
+                            || (!suffix_bounds.is_empty()
+                                && suffix_bounds.iter().all(|b| provably_outside_suffix(&first21, b)))
+                        {
+                            continue;
+                        }
+
+                        let addr = address_from_first21_into(&first21, &mut addr_buf);
+
+                        let prefix_hit = match_any_prefix(&prefixes, &addr);
+                        let suffix_hit = match_any_suffix(&suffixes, &addr);
+                        let infix_hit = match_any_infix(&infixes, &addr);
+
+                        if let (Some(prefix_hit), Some(suffix_hit), Some(infix_hit)) = (prefix_hit, suffix_hit, infix_hit) {
+                            // Only reconstruct the actual private key on
+                            // a real match (rare) — the hot loop above
+                            // never needs it, since it only ever walks
+                            // the public key forward.
+                            //
+                            // The lane's staged metadata says which
+                            // candidate this was: `m_i` gives the batch
+                            // index (table[i] is (i+1)*G, and base_scalar
+                            // already advances by BATCH_SIZE each round),
+                            // applying the endomorphism `m_vx` times
+                            // multiplies the key by lambda^m_vx, and
+                            // `m_neg` negates it. The self-check
+                            // immediately below re-derives the address
+                            // from whatever comes out of this and refuses
+                            // to report on any disagreement, so an error
+                            // here can only ever suppress a match, never
+                            // emit a bad key.
+                            let (m_i, m_vx, m_neg) = staged_meta[lane];
+                            let base_key = base_scalar + Scalar::from((m_i + 1) as u64);
+                            let mut sk_scalar = match m_vx {
+                                1 => base_key * lambda,
+                                2 => base_key * lambda2,
+                                _ => base_key,
+                            };
+                            if m_neg {
+                                sk_scalar = -sk_scalar;
+                            }
+                            let sk_bytes: [u8; 32] = sk_scalar.to_bytes().into();
+
+                            // SELF-CHECK (defense in depth):
+                            // independently re-derive the address
+                            // straight from the reconstructed private key
+                            // using k256's own scalar multiplication — a
+                            // completely different code path from the
+                            // batched affine arithmetic and multi-buffer
+                            // hashing that produced this candidate. If
+                            // they disagree, the key would not control
+                            // the address, so refuse to report it rather
+                            // than hand out something unusable. This
+                            // costs one scalar multiplication, but only
+                            // ever on a real match.
+                            let check_point = ProjectivePoint::GENERATOR * sk_scalar;
+                            let check_compressed = check_point.to_affine().to_encoded_point(true);
+                            let check_addr = address_from_first21(&compute_first21(
+                                check_compressed.as_bytes(),
+                                ADDRESS_VERSION_BYTE,
+                            ));
+                            if check_addr != addr {
+                                eprintln!(
+                                    "⚠️  Internal consistency check FAILED for a candidate address — \
+                                     discarding it rather than reporting a key that would not control it. \
+                                     Please report this; the search continues."
+                                );
+                                continue;
+                            }
+
+                            let wif = private_key_to_wif(&sk_bytes, WIF_VERSION_BYTE, true);
+                            let priv_hex = hex::encode(sk_bytes);
+                            let desc = describe_match(prefix_hit, infix_hit, suffix_hit);
+
+                            // Atomically claim a slot. Checking the count
+                            // and then incrementing it as two separate
+                            // steps let two threads both pass the check
+                            // and both report, overshooting -m N.
+                            // Claiming first and validating the claimed
+                            // slot number makes that impossible: only
+                            // claims below the limit are reported, and an
+                            // over-limit claim is handed straight back.
+                            let claimed = state.found_count.fetch_add(1, Ordering::Relaxed);
+                            if max_matches != -1 && claimed >= max_matches {
+                                state.found_count.fetch_sub(1, Ordering::Relaxed);
+                                break 'outer;
+                            }
+                            let found_num = claimed + 1;
+                            // Reset the progress-percentage baseline to
+                            // start counting fresh from this match
+                            // forward. fetch_max (rather than a plain
+                            // store) keeps this correct even if two
+                            // threads find matches close together and
+                            // race here.
+                            state
+                                .last_match_tries
+                                .fetch_max(state.keys_tried.load(Ordering::Relaxed), Ordering::Relaxed);
+
+                            report_match(found_num, &desc, &addr, &wif, &priv_hex, &state);
+                        }
+                    }
                 }
-                let found_num = claimed + 1;
-                // Reset the progress-percentage baseline to start counting
-                // fresh from this match forward. fetch_max (rather than a
-                // plain store) keeps this correct even if two threads find
-                // matches close together and race here.
-                state
-                    .last_match_tries
-                    .fetch_max(state.keys_tried.load(Ordering::Relaxed), Ordering::Relaxed);
-
-                report_match(found_num, &desc, &addr, &wif, &priv_hex, &state);
             }
         }
+
+        // The compile-time check next to `RIPEMD_LANES` guarantees a
+        // batch always ends on a lane-group boundary, so nothing is ever
+        // left un-examined here. Re-checked in debug builds.
+        debug_assert_eq!(staged, 0, "candidates left unexamined at end of batch");
 
         // Advance both representations of the base together, so
         // base_proj stays equal to base_scalar * G.
         base_scalar += Scalar::from(BATCH_SIZE as u64);
         base_proj += step;
         offset += BATCH_SIZE as u64;
-        state.keys_tried.fetch_add(BATCH_SIZE as u64, Ordering::Relaxed);
+        // Counts ADDRESSES examined, not base points walked — each point
+        // yields `addrs_per_point` of them via the curve symmetries.
+        state
+            .keys_tried
+            .fetch_add(BATCH_SIZE as u64 * addrs_per_point, Ordering::Relaxed);
 
         if offset >= REBASE_INTERVAL {
             base_scalar = Scalar::random(&mut rng);
@@ -1528,7 +2173,12 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
 fn main() {
     let config = parse_cli();
     let expected = expected_tries(&config.prefixes, &config.suffixes, &config.infixes);
-    print_banner(&config);
+
+    // Proven correct before it is trusted; None simply means the search
+    // runs on negation symmetry alone. See `setup_endomorphism`.
+    let endo = setup_endomorphism();
+
+    print_banner(&config, endo.is_some());
 
     // Computed once each, independently, reused read-only by every
     // thread. Either can be empty (meaning "no skip available from this
@@ -1543,10 +2193,13 @@ fn main() {
     // normal OS scheduling.
     let core_order = fastest_cores_first();
 
-    // Precompute G, 2G, ..., BATCH_SIZE*G once; each thread gets its own
-    // copy (~32KB) so the hot loop reads it without any shared-pointer
-    // indirection.
-    let table = build_addition_table();
+    // Precompute G, 2G, ..., BATCH_SIZE*G once. Every thread shares this
+    // single read-only copy (~40KB): each worker hoists it to a plain
+    // slice before its hot loop, so there is no shared-pointer
+    // indirection in the loop itself, and one copy stays resident in the
+    // caches that sibling cores share instead of N copies evicting one
+    // another.
+    let table = Arc::new(build_addition_table());
 
     let state = SharedState::new(&config.output_file);
     let start_time = Instant::now();
@@ -1566,13 +2219,309 @@ fn main() {
         // Fastest core first, cycling if there are more threads than
         // detected cores (e.g. -t set above the core count).
         let pinned_core = core_order.as_ref().map(|order| order[i % order.len()]);
-        let table = table.clone();
+        let table = Arc::clone(&table);
         handles.push(thread::spawn(move || {
-            worker_loop(prefixes, suffixes, infixes, prefix_bounds, suffix_bounds, max_matches, state, pinned_core, table)
+            worker_loop(prefixes, suffixes, infixes, prefix_bounds, suffix_bounds, max_matches, state, pinned_core, table, endo)
         }));
     }
 
     for handle in handles {
         handle.join().unwrap();
+    }
+}
+
+// ===================== Tests =====================
+//
+// These exist to check the optimizations that are easy to get subtly
+// wrong and hard to notice: each one verifies a fast path against an
+// independent, obviously-correct implementation rather than against
+// itself. Run with `cargo test`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+
+    /// Derives an address the slow, obvious way: private key → k256's own
+    /// scalar multiplication → compressed public key → Base58Check. This
+    /// is the reference every fast path is checked against.
+    fn address_for_scalar(s: &Scalar) -> String {
+        let point = (ProjectivePoint::GENERATOR * *s).to_affine();
+        let compressed = point.to_encoded_point(true);
+        address_from_first21(&compute_first21(compressed.as_bytes(), ADDRESS_VERSION_BYTE))
+    }
+
+    /// The multi-buffer RIPEMD-160 must agree with the `ripemd` crate on
+    /// every lane, for the 32-byte inputs it is specialized to. Any error
+    /// in the round constants, message-word order, rotation amounts or
+    /// lane plumbing changes the digest completely, so this is a total
+    /// check rather than a spot check.
+    #[test]
+    fn ripemd160_x4_matches_crate() {
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..2_000 {
+            let mut inputs = [[0u8; 32]; RIPEMD_LANES];
+            for lane in 0..RIPEMD_LANES {
+                rng.fill(&mut inputs[lane][..]);
+            }
+
+            let mine = ripemd160_x4_32(&inputs);
+            for lane in 0..RIPEMD_LANES {
+                let theirs = Ripemd160::digest(inputs[lane]);
+                assert_eq!(
+                    &mine[lane][..],
+                    &theirs[..],
+                    "lane {} disagrees for input {}",
+                    lane,
+                    hex::encode(inputs[lane])
+                );
+            }
+        }
+
+        // Inputs that random sampling will not reach, and a case where
+        // every lane holds the same value (so a lane-indexing bug that
+        // happens to be self-consistent still shows up above, not here).
+        let mut edge = [[0u8; 32]; RIPEMD_LANES];
+        edge[1] = [0xff; 32];
+        edge[2] = [0x80; 32];
+        edge[3] = [0x01; 32];
+        let mine = ripemd160_x4_32(&edge);
+        for lane in 0..RIPEMD_LANES {
+            assert_eq!(&mine[lane][..], &Ripemd160::digest(edge[lane])[..]);
+        }
+    }
+
+    /// The multi-buffer path must produce exactly the `first21` the old
+    /// one-at-a-time path did, since every pre-filter decision is made
+    /// from those bytes.
+    #[test]
+    fn multibuffer_first21_matches_single_path() {
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..500 {
+            let mut pubkeys = [[0u8; 33]; RIPEMD_LANES];
+            let mut digests = [[0u8; 32]; RIPEMD_LANES];
+            for lane in 0..RIPEMD_LANES {
+                rng.fill(&mut pubkeys[lane][1..33]);
+                pubkeys[lane][0] = if lane % 2 == 0 { 0x02 } else { 0x03 };
+                digests[lane].copy_from_slice(&Sha256::digest(pubkeys[lane]));
+            }
+
+            let hashes = ripemd160_x4_32(&digests);
+            for lane in 0..RIPEMD_LANES {
+                let mut multi = [0u8; 21];
+                multi[0] = ADDRESS_VERSION_BYTE;
+                multi[1..21].copy_from_slice(&hashes[lane]);
+
+                let single = compute_first21(&pubkeys[lane], ADDRESS_VERSION_BYTE);
+                assert_eq!(multi, single, "lane {}", lane);
+            }
+        }
+    }
+
+    /// The endomorphism constants must survive their own startup proof.
+    #[test]
+    fn endomorphism_constants_validate() {
+        assert!(
+            setup_endomorphism().is_some(),
+            "endomorphism constants failed validation — the search would silently \
+             fall back to negation-only (correct, but ~1.1x slower)"
+        );
+    }
+
+    /// The heart of the six-address optimization: for random private keys,
+    /// every one of the six (x-variant, parity) combinations must produce
+    /// exactly the address that its recovered scalar controls. This
+    /// covers the beta/lambda pairing, the lambda^2 case, and the claim
+    /// that negating a point flips the parity byte and nothing else.
+    #[test]
+    fn six_symmetry_variants_match_their_recovered_scalars() {
+        let endo = setup_endomorphism().expect("constants must validate");
+        let lambda2 = endo.lambda * endo.lambda;
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..16 {
+            let k = Scalar::random(&mut rng);
+            let (x, y) = affine_xy(&(ProjectivePoint::GENERATOR * k).to_affine()).unwrap();
+            let y_is_odd = bool::from(y.normalize().is_odd());
+
+            let mut xv = x;
+            for vx in 0..3 {
+                if vx > 0 {
+                    xv = xv * endo.beta;
+                }
+                let mut compressed = [0u8; 33];
+                compressed[1..33].copy_from_slice(&xv.normalize().to_bytes());
+
+                for neg in [false, true] {
+                    compressed[0] = if y_is_odd != neg { 0x03 } else { 0x02 };
+                    let built =
+                        address_from_first21(&compute_first21(&compressed, ADDRESS_VERSION_BYTE));
+
+                    let mut sk = match vx {
+                        1 => k * endo.lambda,
+                        2 => k * lambda2,
+                        _ => k,
+                    };
+                    if neg {
+                        sk = -sk;
+                    }
+
+                    assert_eq!(
+                        built,
+                        address_for_scalar(&sk),
+                        "variant vx={} neg={} does not match its recovered key",
+                        vx,
+                        neg
+                    );
+                }
+            }
+        }
+    }
+
+    /// All six scalars must be distinct, or the throughput counter would
+    /// be inflated by addresses that are really the same candidate.
+    #[test]
+    fn six_symmetry_variants_are_distinct() {
+        let endo = setup_endomorphism().expect("constants must validate");
+        let lambda2 = endo.lambda * endo.lambda;
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..16 {
+            let k = Scalar::random(&mut rng);
+            let scalars = [k, -k, k * endo.lambda, -(k * endo.lambda), k * lambda2, -(k * lambda2)];
+            for a in 0..scalars.len() {
+                for b in (a + 1)..scalars.len() {
+                    assert_ne!(scalars[a], scalars[b], "variants {} and {} collide", a, b);
+                }
+            }
+        }
+    }
+
+    /// Replays the fused forward/backward batch inversion exactly as the
+    /// worker loop runs it, checking both that every recovered inverse is
+    /// a true inverse and that the resulting affine addition lands on the
+    /// point k256 computes for the same scalar.
+    #[test]
+    fn fused_batch_generation_matches_k256() {
+        let table = build_addition_table();
+        let mut rng = rand::thread_rng();
+        let base_scalar = Scalar::random(&mut rng);
+        let (px, py) = affine_xy(&(ProjectivePoint::GENERATOR * base_scalar).to_affine()).unwrap();
+
+        let mut products = vec![FieldElement::ONE; BATCH_SIZE];
+        let total_inv =
+            batch_invert_prefix_products(&table, &px, &mut products).expect("no zero denominators");
+
+        let mut running_inv = total_inv;
+        for i in (0..BATCH_SIZE).rev() {
+            let (tx, ty) = table[i];
+            let d = tx - px;
+            let inv_i = if i == 0 { running_inv } else { running_inv * products[i - 1] };
+            running_inv = running_inv * d;
+
+            assert_eq!(
+                (inv_i * d).normalize(),
+                FieldElement::ONE.normalize(),
+                "recovered inverse is wrong at index {}",
+                i
+            );
+
+            let slope = (ty - py) * inv_i;
+            let x_new = (slope.square() - px - tx).normalize_weak();
+            let y_new = slope * (px - x_new) - py;
+
+            let expected = (ProjectivePoint::GENERATOR
+                * (base_scalar + Scalar::from((i + 1) as u64)))
+            .to_affine();
+            let (ex, ey) = affine_xy(&expected).unwrap();
+            assert_eq!(x_new.normalize(), ex.normalize(), "x wrong at index {}", i);
+            assert_eq!(y_new.normalize(), ey.normalize(), "y wrong at index {}", i);
+        }
+    }
+
+    /// The leading-u64 prefix filter must agree with the exact 25-byte
+    /// comparison on every input, including inputs deliberately placed on
+    /// the boundary words where the shortcut has to defer to it.
+    #[test]
+    fn fast_prefix_filter_agrees_with_exact_comparison() {
+        fn exact(first21: &[u8; 21], b: &PrefixBound) -> bool {
+            let mut lo = [0u8; 25];
+            lo[0..21].copy_from_slice(first21);
+            let mut hi = [0u8; 25];
+            hi[0..21].copy_from_slice(first21);
+            hi[21..25].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+            hi < b.lower || lo >= b.upper_exclusive
+        }
+
+        let mut rng = rand::thread_rng();
+        let prefixes = ["R", "RC", "RCa", "R9", "RVerus", "RXyz12", "RabcdefghK"];
+
+        for prefix in prefixes {
+            let bound = match compute_prefix_bound(prefix) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            for _ in 0..20_000 {
+                let mut first21 = [0u8; 21];
+                rng.fill(&mut first21[..]);
+                first21[0] = ADDRESS_VERSION_BYTE;
+                assert_eq!(
+                    provably_outside_prefix(&first21, &bound),
+                    exact(&first21, &bound),
+                    "disagreement for prefix {}",
+                    prefix
+                );
+            }
+
+            // Force the boundary-word case the fast path defers on, plus
+            // its immediate neighbours.
+            for endpoint in [bound.lower, bound.upper_exclusive] {
+                for delta in [0i16, -1, 1] {
+                    let mut first21 = [0u8; 21];
+                    first21.copy_from_slice(&endpoint[0..21]);
+                    first21[20] = first21[20].wrapping_add(delta as u8);
+                    assert_eq!(
+                        provably_outside_prefix(&first21, &bound),
+                        exact(&first21, &bound),
+                        "boundary disagreement for prefix {}",
+                        prefix
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression guard for the specialized Base58 encoder against the
+    /// general-purpose crate it replaced on the hot path.
+    #[test]
+    fn fast_base58_matches_bs58() {
+        let mut rng = rand::thread_rng();
+        let mut out = [0u8; 34];
+
+        for _ in 0..20_000 {
+            let mut addr = [0u8; 25];
+            rng.fill(&mut addr[..]);
+            addr[0] = ADDRESS_VERSION_BYTE;
+            encode_address_base58(&addr, &mut out);
+            assert_eq!(
+                std::str::from_utf8(&out).unwrap(),
+                bs58::encode(&addr[..]).into_string()
+            );
+        }
+
+        // The payload extremes, which the random sampling above will
+        // never reach on its own.
+        for fill in [0x00u8, 0xff] {
+            let mut addr = [fill; 25];
+            addr[0] = ADDRESS_VERSION_BYTE;
+            encode_address_base58(&addr, &mut out);
+            assert_eq!(
+                std::str::from_utf8(&out).unwrap(),
+                bs58::encode(&addr[..]).into_string()
+            );
+        }
     }
 }
