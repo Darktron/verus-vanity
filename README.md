@@ -57,6 +57,16 @@ Options:
   -m, --matches <matches>  Number of matching addresses to find; -1 for infinite [default: -1]
   -t, --threads <threads>  Number of threads (default = number of CPU cores) [default: 12]
   -o, --output <output>    Output file to save found wallets
+  -b, --batch <batch>      Points per batch (min = RIPEMD lane count; max scales with -t and RAM)
+      --serve <serve>      Run as cluster master on ADDR:PORT (also searches locally)
+      --join <join>        Run as cluster worker, taking the objective from the master at ADDR:PORT
+      --token <token>      Shared word a worker must present to join a cluster [default: ]
+      --name <name>        Name this worker reports to the master [default: hostname-ish]
+  -k, --keepalive          Worker: stay running when the master stops, and wait for the next objective
+      --stop-workers       Master: tell workers to exit when the objective is met, even keepalive ones
+      --dismiss <dismiss>  Shut down every worker that connects to ADDR:PORT, then exit
+      --keys-stay-local    Worker keeps found keys on its own machine; only addresses are sent
+  -B, --bench              Measure per-stage throughput on this machine and exit
   -v, --version            Print version
   -h, --help               Print help
 ```
