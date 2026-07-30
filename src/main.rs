@@ -24,7 +24,7 @@
 //! them, and record what came back.
 
 use clap::{Arg, ArgAction, Command};
-use ff::Field;
+use ff::{Field, PrimeField};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::{AffinePoint, FieldElement, ProjectivePoint, Scalar};
 use rand::thread_rng;
@@ -33,8 +33,9 @@ use rand_chacha::ChaCha20Rng;
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -54,46 +55,39 @@ const ADDRESS_VERSION_BYTE: u8 = 0x3c;
 /// VerusCoin mainnet WIF (private key) version byte.
 const WIF_VERSION_BYTE: u8 = 0xbc;
 
-/// How many candidate keys are produced per batch — see the
-/// "Batched affine point generation" section below for what a batch
-/// actually does. The single modular inversion each batch requires is
-/// amortized across this many points, so bigger is better up to a point,
-/// but the per-point cost is dominated by multiplications that scale
-/// linearly either way.
+/// How many candidate keys are produced per batch.
 ///
-/// Measured to be on a plateau: 256 was slightly slower, 512 and 1024
-/// equivalent, so anything in that region performs the same. (Those
-/// readings predate several rounds of optimization and the absolute
-/// numbers are long obsolete; the shape of the curve is what still
-/// applies, and `--bench` is the way to re-check it.)
+/// Batching exists to amortize the one modular inversion each batch
+/// needs across many points, so throughput rises with size until the
+/// working set stops fitting in cache. MEASURED on a Snapdragon 8 Elite
+/// (8 threads, median of 5, addresses/second):
 ///
-/// MUST STAY HIGHLY COMPOSITE. Candidates are hashed in groups of
-/// `RIPEMD_LANES`, so a batch has to divide evenly into those groups —
-/// both when the endomorphism is on (6 addresses per point) and when it
-/// is off (2). The compile-time checks beside `RIPEMD_LANES` enforce it.
+///      64 -> 37.2      2048 -> 45.6     32768 -> 45.5
+///     128 -> 41.1      4096 -> 45.8     65536 -> 47.0
+///     256 -> 43.5      8192 -> 45.8    131072 -> 45.6
+///     512 -> 44.6     16384 -> 45.5    262144 -> 43.1
 ///
-/// 480 = 2^5 * 3 * 5 is chosen for exactly that reason: it keeps
-/// `BATCH_SIZE * 2` at 960, which divides by 4, 8, 12, 16, 20 and 24, so
-/// `VECS` can be tuned across its whole useful range without this needing
-/// to change. A power of two like 512 looks tidier but only divides by
-/// lane counts that are themselves powers of two — it fails immediately
-/// at `VECS = 3`, which measurement suggested was worth trying.
+/// It rises steeply to about 2048, is flat from there to roughly 8192,
+/// and falls away past 131072. A real search confirmed the difference at
+/// the ends: 43.6 MW/s sustained at 480, 44.8 at 4096 — +2.8%, with mean
+/// and median agreeing.
 ///
-/// IMPORTANT: this controls STACK usage. One array of this length lives
-/// on each worker thread's stack (`products`), so 480 uses roughly 19KB
-/// of a thread's default 2MB stack. Raising it substantially (past
-/// ~8192) risks a stack overflow and buys nothing measurable given the
-/// flat scaling above.
+/// So the default sits in that plateau. Why 3840 rather than 4096: the
+/// assertions below require BATCH_SIZE * 2 and * 6 to divide evenly by
+/// the lane count, because candidates are staged in lane groups and a
+/// partial group at the end of a batch would be silently skipped. 4096 is
+/// 2^12, so it is not divisible by 12 — a `VERUS_VECS=3` build would fail
+/// to compile, and `tune-lanes.sh` builds exactly that. 3840 is
+/// 2^8 x 3 x 5, which covers every lane width either backend can be
+/// built with, and sits inside the flat region where 4096 measured
+/// identically anyway.
 ///
-/// Worth re-measuring: the "512 and 1024 are equivalent" result above was
-/// taken when the batch needed TWO scratch arrays plus the table, giving
-/// a per-thread working set (~80KB) well over L1, which flattens the
-/// scaling curve by making every batch L2-bound regardless of size. The
-/// second array has since been eliminated (see
-/// `batch_invert_prefix_products`), so smaller batches now have a real
-/// chance of staying L1-resident and the old measurement may no longer
-/// hold.
-const BATCH_SIZE: usize = 480;
+/// The previous default of 480 was chosen only for that divisibility, not
+/// for throughput — it sits well down the rising part of the curve.
+///
+/// Overridable per run with `-b`, which is worth doing on a device with a
+/// small shared cache: a big batch there can thrash it.
+const BATCH_SIZE: usize = 3840;
 
 /// How many keys a thread walks from one random starting point before
 /// picking a fresh random start again. Purely routine hygiene for very
@@ -421,13 +415,58 @@ fn describe_match(prefix_hit: Option<&str>, infix_hit: Option<&str>, suffix_hit:
 /// here). Combined probability across categories is approximated as the
 /// product of their individual probabilities (treating leading,
 /// trailing, and arbitrary-position windows as independent).
+/// Interprets a 25-byte big-endian value as f64. Only used for
+/// probability estimates, where f64's ~15 significant digits are far more
+/// precision than an ETA needs.
+fn bytes25_to_f64(b: &[u8; 25]) -> f64 {
+    let mut v = 0.0f64;
+    for &x in b.iter() {
+        v = v * 256.0 + x as f64;
+    }
+    v
+}
+
+/// Exact probability that a random VerusCoin address starts with
+/// `prefix`.
+///
+/// The obvious formula — 58^-(len-1), one free character for the
+/// guaranteed leading 'R' — is wrong, and not by a little. Address values
+/// only ever occupy [version * 2^192, (version+1) * 2^192), which covers
+/// just 24 of the 58 possible second-character buckets, so that character
+/// is about 2.4x more likely to match than 1/58 suggests. For `-p RCAB`
+/// the old formula predicted 195,112 tries against a true expectation of
+/// 78,509 — a 2.49x overestimate, which showed up as searches finishing
+/// far sooner than the ETA claimed.
+///
+/// This instead measures how much of the achievable value range the
+/// prefix's own Base58 bucket covers, reusing the exact bounds already
+/// computed for the pre-filter. Returns None if the bucket cannot be
+/// computed, leaving the caller to fall back to the rough formula.
+fn prefix_probability(prefix: &str) -> Option<f64> {
+    let bound = compute_prefix_bound(prefix)?;
+    let bucket_lo = bytes25_to_f64(&bound.lower);
+    let bucket_hi = bytes25_to_f64(&bound.upper_exclusive);
+
+    let span = 2f64.powi(192);
+    let achievable_lo = ADDRESS_VERSION_BYTE as f64 * span;
+    let achievable_hi = (ADDRESS_VERSION_BYTE as f64 + 1.0) * span;
+
+    let overlap = (bucket_hi.min(achievable_hi) - bucket_lo.max(achievable_lo)).max(0.0);
+    Some(overlap / (achievable_hi - achievable_lo))
+}
+
 fn expected_tries(prefixes: &[String], suffixes: &[String], infixes: &[String]) -> f64 {
     let prefix_probs: Vec<f64> = if prefixes.is_empty() {
         vec![1.0]
     } else {
         prefixes
             .iter()
-            .map(|p| BASE58_ALPHABET_SIZE.powi(-(p.len().saturating_sub(1) as i32)))
+            .map(|p| {
+                // Exact where possible; the rough 58^-(len-1) form only as
+                // a fallback. See `prefix_probability`.
+                prefix_probability(p)
+                    .unwrap_or_else(|| BASE58_ALPHABET_SIZE.powi(-(p.len().saturating_sub(1) as i32)))
+            })
             .collect()
     };
     let suffix_probs: Vec<f64> = if suffixes.is_empty() {
@@ -678,7 +717,10 @@ mod lane_ops {
     ///
     /// Do not re-tune this without re-measuring; the optimum is a narrow
     /// peak, not a plateau.
-    const VECS: usize = 2;
+    ///
+    /// Overridable at build time for devices that were never measured:
+    ///     VERUS_VECS=3 cargo build --release
+    const VECS: usize = super::env_usize(option_env!("VERUS_VECS"), 2);
 
     pub const LANES: usize = VECS * 4;
 
@@ -814,13 +856,24 @@ mod lane_ops {
     /// chains on a target with no SIMD at all, which still helps for the
     /// same reason.
     ///
-    /// UNMEASURED on x86_64 — this mirrors what the aarch64 numbers
-    /// showed. Run `--bench` there and adjust; if the RIPEMD speedup is
-    /// well under `LANES`, try 8 and 32 before assuming this is right.
+    /// MEASURED on x86_64 (AVX2, `--bench`, three runs each, scalar
+    /// baseline ~242-258 ns/hash):
+    ///
+    ///     8 lanes  236-252 ns/hash  ~1.00x  (no gain)
+    ///    16 lanes  262-269 ns/hash  ~0.96x  (slower than scalar)
+    ///    32 lanes  139-158 ns/hash  ~1.67x
+    ///    64 lanes   97-102 ns/hash  ~2.47x
+    ///
+    /// End-to-end that is 1.34x (-p), 1.26x (-s) and 1.20x (-i) over the
+    /// 16 that was here before, which was actually a small net LOSS
+    /// against just calling the `ripemd` crate. The kernel is
+    /// latency-bound, so it wants many more independent chains than one
+    /// register's width suggests. 128 was not tried: it needs BATCH_SIZE
+    /// divisible by 64, so it cannot be changed on its own.
     #[cfg(target_arch = "x86_64")]
-    pub const LANES: usize = 16;
+    pub const LANES: usize = super::env_usize(option_env!("VERUS_LANES"), 64);
     #[cfg(not(target_arch = "x86_64"))]
-    pub const LANES: usize = 8;
+    pub const LANES: usize = super::env_usize(option_env!("VERUS_LANES"), 8);
 
     pub type Lane = [u32; LANES];
 
@@ -1477,6 +1530,192 @@ fn wif_to_qr_string(wif: &str) -> String {
     }
 }
 
+/// Reads a small integer from an environment variable at COMPILE time,
+/// falling back to `default` when unset or unparseable.
+///
+/// Lane width has to be a compile-time constant — the kernel state lives
+/// in fixed-size arrays of vector registers, and Rust cannot size those
+/// from a runtime value without nightly features. This is the next best
+/// thing: it can be changed per device without editing any source.
+///
+///     VERUS_VECS=3 cargo build --release      # aarch64/NEON
+///     VERUS_LANES=32 cargo build --release    # everything else
+///
+/// `--bench` prints the width actually compiled in, so a build can
+/// always be checked.
+const fn env_usize(v: Option<&str>, default: usize) -> usize {
+    // Byte comparison rather than string matching: `match` on `str` is
+    // not permitted in a const.
+    match v {
+        None => default,
+        Some(s) => {
+            let b = s.as_bytes();
+            let mut i = 0;
+            let mut acc = 0usize;
+            while i < b.len() {
+                let d = b[i];
+                if d < b'0' || d > b'9' {
+                    return default;
+                }
+                acc = acc * 10 + (d - b'0') as usize;
+                i += 1;
+            }
+            if acc == 0 { default } else { acc }
+        }
+    }
+}
+
+// ===================== Auto-tuning =====================
+//
+// The best batch size and thread count are properties of the specific
+// CPU, not of the program: cache sizes decide how large a batch can be
+// before the working set stops fitting, and a phone's power budget
+// decides how many threads actually add throughput before clocks drop to
+// compensate. A value that is right for a modern desktop core can be
+// wrong by a wide margin on an older in-order phone core.
+//
+// `-b` and `-t` expose both so a device can be matched without
+// rebuilding. The measurement helper below runs the REAL search — same
+// worker threads, same kernel, same filters — for a short interval and
+// counts addresses, rather than timing a synthetic stand-in that might
+// not share the cache behaviour being measured. It is used by `-B` to
+// report what the machine actually does.
+
+
+/// Ceiling on the memory the batch buffers may occupy. This is not a
+/// performance limit — throughput stops improving long before here,
+/// because the single modular inversion a batch amortizes is already
+/// negligible per point by a few thousand. It exists so that a mistyped
+/// `-b` cannot ask the allocator for more memory than the device has:
+/// `-b 40000000` on 8 threads would otherwise reach for about 16 GB.
+const BATCH_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+
+/// Bytes the batch buffers need. The addition table holds two field
+/// elements per point and is shared by every thread; each thread also
+/// keeps one per point for the batch inversion.
+fn batch_memory_bytes(batch: usize, threads: usize) -> usize {
+    std::mem::size_of::<FieldElement>().saturating_mul(batch).saturating_mul(2 + threads)
+}
+
+/// Largest batch that fits the budget at this thread count. Reported in
+/// errors so the bound is a number rather than a mystery.
+fn max_batch_for(threads: usize) -> usize {
+    let per_point = std::mem::size_of::<FieldElement>() * (2 + threads);
+    (BATCH_MEMORY_BUDGET / per_point.max(1)).max(RIPEMD_LANES)
+}
+
+/// A prefix long enough that a match is effectively impossible during a
+/// calibration interval, so timing is never disturbed by match
+/// reporting. Still a legitimately achievable prefix, so the pre-filter
+/// behaves exactly as it would in a real search.
+const TUNE_PREFIX: &str = "RCABCDEFG";
+
+/// Runs the real search at a given configuration and returns measured
+/// addresses per second.
+fn measure_throughput(
+    batch_size: usize,
+    threads: usize,
+    dur: Duration,
+    shared_table: Option<&Arc<Vec<(FieldElement, FieldElement)>>>,
+) -> f64 {
+    let prefixes = vec![TUNE_PREFIX.to_string()];
+    let prefix_bounds = try_compute_all_prefix_bounds(&prefixes);
+    // Reuse a caller-supplied table when there is one.
+    //
+    // Building it here instead was a systematic bias, not just wasted
+    // work: `build_addition_table` walks the curve one point at a time on
+    // a single thread, so it takes LONGER for a bigger batch — and that
+    // stretch of quiet, single-threaded work is a cooldown immediately
+    // before the timed window. Large batches were being measured on a
+    // cooler device than small ones, which is exactly the direction of
+    // the error seen in practice: a sweep reported 48.6 MW/s for batch
+    // 65536 while a real search at that setting sustained about 45.2.
+    //
+    // Entry i of the table is (i+1)*G regardless of how long the table
+    // is, so one table built at the largest candidate size is correct for
+    // every smaller one — the worker only ever reads its first
+    // `batch_size` entries.
+    let owned;
+    let table = match shared_table {
+        Some(t) if t.len() >= batch_size => Arc::clone(t),
+        _ => {
+            owned = Arc::new(build_addition_table(batch_size));
+            Arc::clone(&owned)
+        }
+    };
+    let endo = setup_endomorphism();
+    let state = SharedState::new(&None);
+
+    let mut handles = Vec::new();
+    for _ in 0..threads {
+        let p = prefixes.clone();
+        let pb = prefix_bounds.clone();
+        let st = state.clone();
+        let tb = Arc::clone(&table);
+        handles.push(thread::spawn(move || {
+            worker_loop(p, Vec::new(), Vec::new(), pb, Vec::new(), -1, st, tb, endo, batch_size)
+        }));
+    }
+
+    // Let the threads spin up and caches warm before the timed window.
+    thread::sleep(Duration::from_millis(60));
+    let start_count = state.keys_tried.load(Ordering::Relaxed);
+    let t = Instant::now();
+
+    // The counter advances once per COMPLETED batch, so a window that
+    // only fits a couple of batches produces a quantised reading rather
+    // than a rate — at batch 131072 on a slow core, one batch can outlast
+    // a 500 ms window entirely, and every "sample" then returns the same
+    // number (a spread of exactly 0.0%, which is the giveaway). Large
+    // batches were being judged on noise-free nonsense.
+    //
+    // So the window closes on whichever comes last: the requested
+    // duration, or enough completed batches to be meaningful. The hard
+    // cap keeps a hopeless candidate from stalling the sweep; a candidate
+    // that hits the cap is reported as unmeasurable rather than guessed
+    // at.
+    const MIN_BATCHES_PER_THREAD: u64 = 6;
+    let needed = (batch_size as u64)
+        .saturating_mul(addrs_per_point_hint())
+        .saturating_mul(MIN_BATCHES_PER_THREAD)
+        .saturating_mul(threads as u64);
+    let cap = dur.saturating_mul(6);
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let counted = state.keys_tried.load(Ordering::Relaxed) - start_count;
+        let elapsed = t.elapsed();
+        if elapsed >= dur && counted >= needed {
+            break;
+        }
+        if elapsed >= cap {
+            break;
+        }
+    }
+
+    let elapsed = t.elapsed().as_secs_f64();
+    let counted = state.keys_tried.load(Ordering::Relaxed) - start_count;
+
+    state.stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        let _ = h.join();
+    }
+    counted as f64 / elapsed
+}
+/// Addresses produced per base point once the curve symmetries are
+/// applied. Used only to size measurement windows; the search itself
+/// derives this from whether the endomorphism is available.
+fn median_of<F: FnMut() -> f64>(samples: usize, mut f: F) -> f64 {
+    let mut v: Vec<f64> = (0..samples).map(|_| f()).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
+}
+
+/// Addresses produced per base point once the curve symmetries are
+/// applied. Used only to size measurement windows.
+fn addrs_per_point_hint() -> u64 {
+    6
+}
+
 // ===================== CLI configuration =====================
 
 /// Parsed and validated command-line configuration.
@@ -1494,9 +1733,16 @@ struct Config {
     suffix_arg: Option<String>,
     infix_arg: Option<String>,
     threads: usize,
+    batch_size: usize,
     max_matches: i64,
     output_file: Option<String>,
     any_normalized: bool,
+    /// Address to serve a cluster on, when acting as master.
+    serve: Option<String>,
+    /// Shared word a worker must present to join.
+    token: String,
+    /// Tell workers to exit rather than idle when the objective is met.
+    stop_workers: bool,
 }
 
 /// Parses CLI arguments, auto-normalizes prefixes (see `normalize_prefix`),
@@ -1506,7 +1752,7 @@ fn parse_cli() -> Config {
     let cpu_cores_str: &'static str = Box::leak(num_cpus::get().to_string().into_boxed_str());
 
     let matches = Command::new("verus-vanity")
-        .version("0.7.2")
+        .version("0.8.0")
         .author("Darktron")
         .about("VerusCoin Vanity Wallet Generator\nMade by Darktron")
         .disable_version_flag(true)
@@ -1559,8 +1805,65 @@ fn parse_cli() -> Config {
                 .num_args(1),
         )
         .arg(
-            Arg::new("bench")
+            Arg::new("batch")
                 .short('b')
+                .long("batch")
+                .help("Points per batch (min = RIPEMD lane count; max scales with -t and RAM)")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("serve")
+                .long("serve")
+                .help("Run as cluster master on ADDR:PORT (also searches locally)")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("join")
+                .long("join")
+                .help("Run as cluster worker, taking the objective from the master at ADDR:PORT")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("token")
+                .long("token")
+                .help("Shared word a worker must present to join a cluster")
+                .default_value("")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("name")
+                .long("name")
+                .help("Name this worker reports to the master [default: hostname-ish]")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("keepalive")
+                .short('k')
+                .long("keepalive")
+                .action(ArgAction::SetTrue)
+                .help("Worker: stay running when the master stops, and wait for the next objective"),
+        )
+        .arg(
+            Arg::new("stop-workers")
+                .long("stop-workers")
+                .action(ArgAction::SetTrue)
+                .help("Master: tell workers to exit when the objective is met, even keepalive ones"),
+        )
+        .arg(
+            Arg::new("dismiss")
+                .long("dismiss")
+                .help("Shut down every worker that connects to ADDR:PORT, then exit")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("keys-stay-local")
+                .long("keys-stay-local")
+                .action(ArgAction::SetTrue)
+                .help("Worker keeps found keys on its own machine; only addresses are sent"),
+        )
+        .arg(
+            Arg::new("bench")
+                .short('B')
                 .long("bench")
                 .action(ArgAction::SetTrue)
                 .help("Measure per-stage throughput on this machine and exit"),
@@ -1581,6 +1884,61 @@ fn parse_cli() -> Config {
         std::process::exit(0);
     }
 
+    if let Some(listen) = matches.get_one::<String>("dismiss") {
+        run_dismiss(
+            listen,
+            matches.get_one::<String>("token").map(|s| s.as_str()).unwrap_or(""),
+        );
+        std::process::exit(0);
+    }
+
+    // A worker takes its patterns from the master, so it must dispatch
+    // before the "give me a pattern" requirement below.
+    if let Some(master) = matches.get_one::<String>("join") {
+        let threads: usize = matches
+            .get_one::<String>("threads")
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|_| num_cpus::get())
+            .max(1);
+        let max_batch = max_batch_for(threads);
+        let batch = match matches.get_one::<String>("batch") {
+            Some(raw) => raw
+                .parse::<usize>()
+                .unwrap_or(BATCH_SIZE)
+                .clamp(RIPEMD_LANES, max_batch)
+                .next_multiple_of(RIPEMD_LANES),
+            None => BATCH_SIZE.clamp(RIPEMD_LANES, max_batch),
+        };
+        let default_name = format!("worker-{}", std::process::id());
+        let name = matches
+            .get_one::<String>("name")
+            .cloned()
+            .unwrap_or(default_name)
+            .replace(' ', "_");
+        run_cluster_worker(
+            master,
+            matches.get_one::<String>("token").map(|s| s.as_str()).unwrap_or(""),
+            &name,
+            threads,
+            batch,
+            matches.get_flag("keys-stay-local"),
+            matches.get_flag("keepalive"),
+        );
+        std::process::exit(0);
+    }
+
+
+
+    // Batch size is a runtime choice so a device can be matched without
+    // rebuilding — small caches (older phones) generally want a smaller
+    // batch than the default, which is sized for a large modern core.
+    //
+    // It must stay a multiple of RIPEMD_LANES: candidates are staged into
+    // lane groups, and a partial group at the end of a batch would be
+    // silently dropped. Rounding up to the next multiple guarantees this
+    // for every variant count, which is what the compile-time assertion
+    // on the default does.
     let prefix_arg = matches.get_one::<String>("prefix").cloned();
     let suffix_arg = matches.get_one::<String>("suffix").cloned();
     let infix_arg = matches.get_one::<String>("infix").cloned();
@@ -1593,12 +1951,58 @@ fn parse_cli() -> Config {
     let output_file = matches.get_one::<String>("output").cloned();
     // Clamp to at least 1: `-t 0` would otherwise spawn no workers and
     // exit immediately without searching or explaining why.
-    let threads: usize = matches
-        .get_one::<String>("threads")
-        .unwrap()
-        .parse()
-        .unwrap_or(num_cpus::get())
-        .max(1);
+    let threads_given = matches.value_source("threads") == Some(clap::parser::ValueSource::CommandLine);
+    let threads: usize = if threads_given {
+        matches.get_one::<String>("threads").unwrap().parse().unwrap_or(num_cpus::get()).max(1)
+    } else {
+        num_cpus::get().max(1)
+    };
+
+    // Parsed after the thread count, because the usable upper bound
+    // depends on it: the per-thread inversion buffer is duplicated once
+    // per thread.
+    //
+    // Lower bound is RIPEMD_LANES, and it is a hard one: candidates are
+    // staged in lane groups, so a batch smaller than one group could not
+    // fill it. Values in between are rounded up for the same reason.
+    let max_batch = max_batch_for(threads);
+    let batch_size = match matches.get_one::<String>("batch") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(v) if v >= RIPEMD_LANES && v <= max_batch => {
+                let rounded = v.next_multiple_of(RIPEMD_LANES);
+                if rounded != v {
+                    eprintln!(
+                        "Note: batch size {} rounded up to {} (must be a multiple of the {} RIPEMD lanes).",
+                        v, rounded, RIPEMD_LANES
+                    );
+                }
+                rounded
+            }
+            Ok(v) if v > max_batch => {
+                eprintln!(
+                    "⚠️  --batch/-b {} is too large: with {} threads that would need {:.1} GB.\n  \
+                     The limit here is {} (about {:.0} MB). Throughput stops improving well below\n  \
+                     this anyway — the inversion a batch amortizes is already negligible per point\n  \
+                     by a few thousand.",
+                    v,
+                    threads,
+                    batch_memory_bytes(v, threads) as f64 / 1e9,
+                    max_batch,
+                    BATCH_MEMORY_BUDGET as f64 / 1e6
+                );
+                std::process::exit(1);
+            }
+            _ => {
+                eprintln!(
+                    "⚠️  --batch/-b must be a whole number between {} and {} on this machine\n  \
+                     ({} threads). The lower bound is the RIPEMD lane count.",
+                    RIPEMD_LANES, max_batch, threads
+                );
+                std::process::exit(1);
+            }
+        },
+        None => BATCH_SIZE.clamp(RIPEMD_LANES, max_batch),
+    };
     let max_matches: i64 = matches
         .get_one::<String>("matches")
         .unwrap()
@@ -1645,6 +2049,10 @@ fn parse_cli() -> Config {
         suffix_arg,
         infix_arg,
         threads,
+        batch_size,
+        serve: matches.get_one::<String>("serve").cloned(),
+        token: matches.get_one::<String>("token").cloned().unwrap_or_default(),
+        stop_workers: matches.get_flag("stop-workers"),
         max_matches,
         output_file,
         any_normalized,
@@ -1761,11 +2169,28 @@ struct SharedState {
     /// after early luck on the first couple of matches.
     last_match_tries: Arc<AtomicU64>,
     output_writer: Option<Arc<Mutex<BufWriter<File>>>>,
+    /// Set to halt every worker. Only used by auto-tuning, which runs the
+    /// real search for a short interval and then stops it; a normal search
+    /// never sets this.
+    stop: Arc<AtomicBool>,
     /// Serializes match reporting. Each report is many lines (address,
     /// WIF, key, and a whole QR code); without this, two threads finding
     /// matches at the same moment interleave their lines and produce an
     /// unreadable, unscannable mess on the terminal.
     report_lock: Arc<Mutex<()>>,
+    /// When set, a found match is handed here instead of being printed
+    /// locally. Used by cluster workers, whose matches belong to the
+    /// master rather than to their own terminal.
+    match_sink: Option<std::sync::mpsc::Sender<MatchRecord>>,
+    /// Addresses contributed by workers since the last progress tick.
+    /// Every worker ADDS to this and the stats thread drains it, so the
+    /// figure is the whole cluster rather than one member. Zero when
+    /// running standalone.
+    remote_rate: Arc<AtomicU64>,
+    /// Addresses tried by connected workers, accumulated. Counted
+    /// separately from `keys_tried` so the progress line can show a
+    /// combined total without workers racing the local counter.
+    remote_tried: Arc<AtomicU64>,
 }
 
 impl SharedState {
@@ -1785,7 +2210,11 @@ impl SharedState {
             keys_tried: Arc::new(AtomicU64::new(0)),
             last_match_tries: Arc::new(AtomicU64::new(0)),
             output_writer,
+            stop: Arc::new(AtomicBool::new(false)),
             report_lock: Arc::new(Mutex::new(())),
+            match_sink: None,
+            remote_rate: Arc::new(AtomicU64::new(0)),
+            remote_tried: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1831,12 +2260,30 @@ fn spawn_stats_thread(state: SharedState, start_time: Instant, expected: f64, ta
                 "done".to_string()
             };
 
-            println!(
-                "Progress: {} ({} tried, {})",
-                progress,
-                format_with_si(total),
-                format_with_si_rate(rate)
-            );
+            // Workers count separately so they never race the local
+            // counter; the line adds them back for a cluster total.
+            // Drained, not read: every worker adds its report here, so
+            // taking and clearing it gives the cluster's contribution for
+            // this interval.
+            let rrate = state.remote_rate.swap(0, Ordering::Relaxed);
+            let rtried = state.remote_tried.load(Ordering::Relaxed);
+            if rtried > 0 || rrate > 0 {
+                println!(
+                    "Progress: {} ({} tried, {}) [local {} + cluster {}]",
+                    progress,
+                    format_with_si(total + rtried),
+                    format_with_si_rate(rate + rrate),
+                    format_with_si_rate(rate),
+                    format_with_si_rate(rrate)
+                );
+            } else {
+                println!(
+                    "Progress: {} ({} tried, {})",
+                    progress,
+                    format_with_si(total),
+                    format_with_si_rate(rate)
+                );
+            }
         }
     });
 }
@@ -1846,6 +2293,19 @@ fn spawn_stats_thread(state: SharedState, start_time: Instant, expected: f64, ta
 /// Prints a found match (address, WIF, hex key, QR code) to stdout, and
 /// appends the same information to the output file if one was configured.
 fn report_match(found_num: i64, desc: &str, addr: &str, wif: &str, priv_hex: &str, state: &SharedState) {
+    // A cluster worker forwards its find to the master rather than
+    // printing it. The master is the one deciding whether the objective
+    // is met, so it has to be the one that records the result.
+    if let Some(tx) = &state.match_sink {
+        let _ = tx.send(MatchRecord {
+            desc: desc.to_string(),
+            addr: addr.to_string(),
+            wif: wif.to_string(),
+            priv_hex: priv_hex.to_string(),
+        });
+        return;
+    }
+
     let qr = wif_to_qr_string(wif);
     let body = format!(
         "----- MATCH {} for {} FOUND -----\nAddress: {}\nWIF: {}\nPrivate Key (hex): {}\n\
@@ -1866,46 +2326,6 @@ fn report_match(found_num: i64, desc: &str, addr: &str, wif: &str, priv_hex: &st
         output.flush().ok();
     }
 }
-
-// ===================== Optional performance-core targeting =====================
-//
-// Many phone SoCs mix fast "performance" cores with slower "efficiency"
-// cores (big.LITTLE / DynamIQ). Left to the OS scheduler, some worker
-// threads can end up running on the slow cores, diluting average
-// throughput — especially when -t is set below the total core count.
-// This tries to identify the fastest cores (via each core's max clock
-// speed, read from sysfs) and pin worker threads to them specifically,
-// fastest-first.
-//
-// This is entirely best-effort and safe to fail: if core IDs can't be
-// enumerated, if ANY core's frequency can't be read, or if pinning
-// itself fails, this quietly does nothing and threads run exactly as
-// they did before this existed — plain OS scheduling, no behavior
-// change, no risk. It never touches anything cryptographic.
-
-/// Reads a core's maximum clock speed from sysfs (Linux/Android/Termux).
-/// Returns None if unavailable — e.g. in containers/VMs, or on any
-/// platform that doesn't expose this, which is common and expected.
-fn core_max_freq_khz(core_id: usize) -> Option<u64> {
-    let path = format!("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", core_id);
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-/// Attempts to order available cores fastest-first. Returns None (rather
-/// than a partially-correct guess) unless every core's frequency was
-/// readable — a partial ordering could be misleading, so this only ever
-/// acts on complete information.
-fn fastest_cores_first() -> Option<Vec<core_affinity::CoreId>> {
-    let core_ids = core_affinity::get_core_ids()?;
-    let mut with_freq = Vec::with_capacity(core_ids.len());
-    for core_id in core_ids {
-        let freq = core_max_freq_khz(core_id.id)?;
-        with_freq.push((core_id, freq));
-    }
-    with_freq.sort_by_key(|&(_, freq)| std::cmp::Reverse(freq));
-    Some(with_freq.into_iter().map(|(core_id, _)| core_id).collect())
-}
-
 
 // ===================== Batched affine point generation =====================
 //
@@ -2094,10 +2514,10 @@ fn setup_endomorphism() -> Option<Endomorphism> {
 /// Precomputes the addition table: entry i holds the affine coordinates
 /// of (i+1)*G. Built once at startup and shared (by clone) with every
 /// worker thread.
-fn build_addition_table() -> Vec<(FieldElement, FieldElement)> {
-    let mut table = Vec::with_capacity(BATCH_SIZE);
+fn build_addition_table(batch_size: usize) -> Vec<(FieldElement, FieldElement)> {
+    let mut table = Vec::with_capacity(batch_size);
     let mut acc = ProjectivePoint::GENERATOR;
-    for _ in 0..BATCH_SIZE {
+    for _ in 0..batch_size {
         let xy = affine_xy(&acc.to_affine()).expect("multiples of G are always valid affine points");
         table.push(xy);
         acc += ProjectivePoint::GENERATOR;
@@ -2157,14 +2577,7 @@ fn batch_invert_prefix_products(
 
 /// One worker thread's search loop — see the module note above for the
 /// batched-affine generation strategy.
-fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String>, prefix_bounds: Vec<PrefixBound>, suffix_bounds: Vec<SuffixBound>, max_matches: i64, state: SharedState, pinned_core: Option<core_affinity::CoreId>, table_arc: Arc<Vec<(FieldElement, FieldElement)>>, endo: Option<Endomorphism>) {
-    // Best-effort only — see the module note above `fastest_cores_first`.
-    // If this is None, or if pinning fails on this particular platform,
-    // the thread just runs under normal OS scheduling, exactly as before
-    // this feature existed.
-    if let Some(core_id) = pinned_core {
-        core_affinity::set_for_current(core_id);
-    }
+fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String>, prefix_bounds: Vec<PrefixBound>, suffix_bounds: Vec<SuffixBound>, max_matches: i64, state: SharedState, table_arc: Arc<Vec<(FieldElement, FieldElement)>>, endo: Option<Endomorphism>, batch_size: usize) {
 
     // One read-only copy shared by every thread, hoisted to a plain slice
     // here so the hot loop below indexes it exactly as it would a
@@ -2193,7 +2606,7 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
     // reported match re-derives its address from the scalar and checks it
     // against the matched address before printing, so any drift between
     // the two would be caught rather than producing a bad key.
-    let step = ProjectivePoint::GENERATOR * Scalar::from(BATCH_SIZE as u64);
+    let step = ProjectivePoint::GENERATOR * Scalar::from(batch_size as u64);
     let mut base_scalar = Scalar::random(&mut rng);
     let mut base_proj = ProjectivePoint::GENERATOR * base_scalar;
     let mut offset: u64 = 0;
@@ -2201,7 +2614,9 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
     // Reused across every batch — no per-batch allocation. This is the
     // only full-size buffer the batch needs; see
     // `batch_invert_prefix_products` for why the second one is gone.
-    let mut products = [FieldElement::ONE; BATCH_SIZE];
+    // Heap rather than a stack array so the size is a runtime choice —
+    // allocated once per thread, never per batch.
+    let mut products = vec![FieldElement::ONE; batch_size];
     // Both reused for every candidate — no per-candidate allocation on
     // the hot path.
     let mut addr_buf = [0u8; 34];
@@ -2222,6 +2637,10 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
 
     'outer: loop {
         if max_matches != -1 && state.found_count.load(Ordering::Relaxed) >= max_matches {
+            break;
+        }
+        // Checked once per batch, so it costs nothing measurable.
+        if state.stop.load(Ordering::Relaxed) {
             break;
         }
 
@@ -2258,7 +2677,7 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
         // what the trick requires; nothing downstream depends on the order
         // candidates are examined in.
         let mut running_inv = total_inv;
-        for i in (0..BATCH_SIZE).rev() {
+        for i in (0..batch_size).rev() {
             let (tx, ty) = table[i];
 
             // Recovering inv(d_i) from the running total: dividing out
@@ -2463,14 +2882,14 @@ fn worker_loop(prefixes: Vec<String>, suffixes: Vec<String>, infixes: Vec<String
 
         // Advance both representations of the base together, so
         // base_proj stays equal to base_scalar * G.
-        base_scalar += Scalar::from(BATCH_SIZE as u64);
+        base_scalar += Scalar::from(batch_size as u64);
         base_proj += step;
-        offset += BATCH_SIZE as u64;
+        offset += batch_size as u64;
         // Counts ADDRESSES examined, not base points walked — each point
         // yields `addrs_per_point` of them via the curve symmetries.
         state
             .keys_tried
-            .fetch_add(BATCH_SIZE as u64 * addrs_per_point, Ordering::Relaxed);
+            .fetch_add(batch_size as u64 * addrs_per_point, Ordering::Relaxed);
 
         if offset >= REBASE_INTERVAL {
             base_scalar = Scalar::random(&mut rng);
@@ -2564,7 +2983,7 @@ fn run_bench() {
         Some(e) => (3usize, e.beta),
         None => (1usize, FieldElement::ONE),
     };
-    let table = build_addition_table();
+    let table = build_addition_table(BATCH_SIZE);
     let mut products = vec![FieldElement::ONE; BATCH_SIZE];
     let base_scalar = Scalar::random(&mut rng);
     let (px, py) = affine_xy(&(ProjectivePoint::GENERATOR * base_scalar).to_affine())
@@ -2704,16 +3123,661 @@ fn run_bench() {
     println!("  glue (staging/first21/filter): {:>8.2} ns  ({:>4.1}%)", overhead, 100.0 * overhead / full_ns);
     println!("  ---------------------------------------");
     println!("  total:                         {:>8.2} ns/address", full_ns);
+    println!("  implies ~{:.1} MW/s on 1 core, in this loop", 1000.0 / full_ns);
+    println!();
+
+    // ---------- Measured, not extrapolated ----------
+    // An earlier version printed the line above multiplied by the core
+    // count and called it the machine's throughput. That was wrong twice
+    // over, and the two errors compounded into roughly a factor of two:
+    //
+    //   * it assumed perfect scaling, when per-thread throughput actually
+    //     falls as cores are added (shared cache, memory bandwidth, and on
+    //     a phone a package power budget that lowers clocks under load);
+    //   * a tight microbenchmark loop keeps its working set hot in a way
+    //     the real search does not, so even the single-core figure is
+    //     optimistic.
+    //
+    // So rather than model any of that, just run the real search and
+    // report what it does.
+    println!("Measured on the real search (not extrapolated)");
+    let dur = Duration::from_millis(600);
+    let one = median_of(3, || measure_throughput(BATCH_SIZE, 1, dur, None));
+    println!("  1 thread:                      {:>8.2} MW/s", one / 1e6);
+    if threads > 1 {
+        let many = median_of(3, || measure_throughput(BATCH_SIZE, threads, dur, None));
+        println!("  {} threads:                     {:>8.2} MW/s", threads, many / 1e6);
+        let ideal = one * threads as f64;
+        println!(
+            "  scaling:                       {:>8.0}% of linear ({:.2} MW/s per thread)",
+            100.0 * many / ideal,
+            many / threads as f64 / 1e6
+        );
+        println!();
+        println!("The gap between this and the per-address figure above is");
+        println!("real work the microbenchmark does not see, plus whatever");
+        println!("the scaling percentage is short of 100. Try -b and -t to");
+        println!("find what this machine likes; -b in the low thousands is a");
+        println!("reasonable place to start.");
+    }
+}
+
+// ===================== Clustering =====================
+//
+// Several devices searching for the same patterns, with one of them
+// holding the objective and collecting the results.
+//
+// This problem needs far less coordination than distributed work usually
+// does, and the design leans on that. Every thread already begins at a
+// random 256-bit scalar and walks forward from there, so two machines
+// covering the same ground would require them to land within a batch of
+// each other in a space of 2^256 — it does not happen. That removes the
+// work queue, the range assignment, the duplicate detection and the
+// synchronisation that a cluster would normally need. A worker only has
+// to learn what to look for and have somewhere to send a hit.
+//
+// So the protocol is small and line-based over plain TCP, with no
+// dependencies beyond std: patterns are Base58, which cannot contain a
+// space or a comma, so framing needs nothing clever.
+//
+//   worker -> master   JOIN <proto> <token> <name>
+//   master -> worker   WORK <max_matches> <prefixes> <infixes> <suffixes>
+//                      DENY <reason>
+//   worker -> master   RATE <addresses-since-last-report>
+//                      MATCH <address> <wif> <hex> <desc>
+//   master -> worker   STOP        stop searching (a keepalive worker idles
+//                                  and waits for the next objective)
+//                      SHUTDOWN    exit, whatever --keepalive says
+//
+// `-` stands for an empty pattern list, and a description has its spaces
+// replaced by '_' so a record stays on one line.
+//
+// EVERY MATCH A MASTER RECEIVES IS RE-DERIVED AND RE-CHECKED before it
+// counts (see `verify_remote_match`). A worker is a different machine
+// running a binary the master cannot vouch for, so its claim is treated
+// as a claim: the master recomputes the address from the private key it
+// was sent and confirms both that they agree and that the result
+// actually satisfies the requested patterns. A corrupted transfer, a
+// mismatched build or a tampered record all fail that check, and no
+// forged record can pass it without having done the work.
+//
+// ON PRIVACY: a match carries a private key, and this protocol sends it
+// in the clear. Anyone able to watch the traffic can take the wallet.
+// That is acceptable on a network you control and not otherwise, so both
+// ends say so at startup. `--keys-stay-local` keeps keys on the machine
+// that found them and sends only the address, at the cost of having to
+// collect the file from that device afterwards. For an untrusted path,
+// forward a port over SSH rather than trusting this.
+
+const CLUSTER_PROTO: &str = "v1";
+
+/// A found keypair, as passed between threads and over the wire.
+#[derive(Clone)]
+struct MatchRecord {
+    desc: String,
+    addr: String,
+    wif: String,
+    priv_hex: String,
+}
+
+fn encode_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "-".to_string()
+    } else {
+        items.join(",")
+    }
+}
+
+fn decode_list(field: &str) -> Vec<String> {
+    if field == "-" {
+        Vec::new()
+    } else {
+        field.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    }
+}
+
+/// Re-derives the address from a received private key and confirms it
+/// matches both the claim and the search patterns. See the module note.
+fn verify_remote_match(
+    rec: &MatchRecord,
+    prefixes: &[String],
+    infixes: &[String],
+    suffixes: &[String],
+) -> Result<(), String> {
+    let bytes = match hex::decode(&rec.priv_hex) {
+        Ok(b) => b,
+        Err(_) => return Err("private key is not valid hex".into()),
+    };
+    if bytes.len() != 32 {
+        return Err(format!("private key is {} bytes, expected 32", bytes.len()));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+
+    let scalar = match Option::<Scalar>::from(Scalar::from_repr(arr.into())) {
+        Some(sc) => sc,
+        None => return Err("private key is not a valid scalar".into()),
+    };
+    let point = ProjectivePoint::GENERATOR * scalar;
+    let compressed = point.to_affine().to_encoded_point(true);
+    let derived = address_from_first21(&compute_first21(compressed.as_bytes(), ADDRESS_VERSION_BYTE));
+
+    if derived != rec.addr {
+        return Err(format!("key derives to {}, not the claimed {}", derived, rec.addr));
+    }
+    // The address being real is not enough — it also has to be what was
+    // asked for, or a worker running stale patterns would pollute the
+    // results.
+    let p_ok = match_any_prefix(prefixes, &derived).is_some();
+    let i_ok = match_any_infix(infixes, &derived).is_some();
+    let s_ok = match_any_suffix(suffixes, &derived).is_some();
+    if !(p_ok && i_ok && s_ok) {
+        return Err(format!("{} does not satisfy the requested patterns", derived));
+    }
+    if private_key_to_wif(&arr, WIF_VERSION_BYTE, true) != rec.wif {
+        return Err("WIF does not match the private key".into());
+    }
+    Ok(())
+}
+
+fn write_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
+// ---------- master ----------
+
+/// Serves the objective to workers and collects their results. Returns
+/// once enough matches exist; the local search runs alongside.
+fn spawn_cluster_master(
+    listen: String,
+    token: String,
+    config_prefixes: Vec<String>,
+    config_infixes: Vec<String>,
+    config_suffixes: Vec<String>,
+    max_matches: i64,
+    state: SharedState,
+    stop_workers: bool,
+) -> Arc<Mutex<Vec<TcpStream>>> {
+    // What a finished objective means for the workers. STOP lets a
+    // `--keepalive` worker idle and wait for the next job; SHUTDOWN ends
+    // it regardless, which is how a cluster gets dismissed on purpose.
+    let final_msg: &str = if stop_workers { "SHUTDOWN" } else { "STOP" };
+
+    // Live worker connections, so the master can notify them before it
+    // exits. Relying on the per-worker handler to do it loses the race:
+    // the moment the objective is met the search threads finish, main
+    // returns and the process dies, taking the handler with it before it
+    // has written anything. The worker then sees a bare disconnect and,
+    // if it is keepalive, goes back to waiting — which is exactly what
+    // --stop-workers is meant to prevent.
+    let conns: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+    let conns_for_listener = Arc::clone(&conns);
+    let listener = match TcpListener::bind(&listen) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("⚠️  Could not listen on {}: {}", listen, e);
+            std::process::exit(1);
+        }
+    };
+    println!("Cluster master listening on {}", listen);
+    if token.is_empty() {
+        println!("  no --token set: any device that can reach this port may join");
+    }
     println!(
-        "  implies ~{:.1} MW/s on 1 core, ~{:.1} MW/s on {}",
-        1000.0 / full_ns,
-        1000.0 * threads as f64 / full_ns,
-        threads
+        "  workers send private keys in the clear — use this on a network you\n  \
+         control, or forward the port over SSH"
     );
     println!();
-    println!("A real run lands a little under this — thread scheduling,");
-    println!("memory contention and thermal limits are not modelled — but");
-    println!("every per-candidate cost now is.");
+
+    thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let peer = stream
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "unknown".into());
+
+            let token = token.clone();
+            let final_msg = final_msg.to_string();
+            let conns = Arc::clone(&conns_for_listener);
+            let p = config_prefixes.clone();
+            let i = config_infixes.clone();
+            let sfx = config_suffixes.clone();
+            let st = state.clone();
+
+            thread::spawn(move || {
+                let reader_stream = match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut reader = BufReader::new(reader_stream);
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() {
+                    return;
+                }
+
+                let parts: Vec<&str> = first.trim().split(' ').collect();
+                if parts.len() < 4 || parts[0] != "JOIN" {
+                    let _ = write_line(&mut stream, "DENY malformed-join");
+                    return;
+                }
+                if parts[1] != CLUSTER_PROTO {
+                    let _ = write_line(&mut stream, "DENY protocol-mismatch");
+                    eprintln!("Rejected {}: protocol {} (this build speaks {})", peer, parts[1], CLUSTER_PROTO);
+                    return;
+                }
+                if parts[2] != token {
+                    let _ = write_line(&mut stream, "DENY bad-token");
+                    eprintln!("Rejected {}: wrong token", peer);
+                    return;
+                }
+                let name = parts[3].to_string();
+
+                let work = format!(
+                    "WORK {} {} {} {}",
+                    max_matches,
+                    encode_list(&p),
+                    encode_list(&i),
+                    encode_list(&sfx)
+                );
+                if write_line(&mut stream, &work).is_err() {
+                    return;
+                }
+                println!("Worker joined: {} ({})", name, peer);
+                if let Ok(mut list) = conns.lock() {
+                    if let Ok(c) = stream.try_clone() {
+                        list.push(c);
+                    }
+                }
+
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let t = line.trim();
+                    if let Some(rest) = t.strip_prefix("RATE ") {
+                        if let Ok(n) = rest.trim().parse::<u64>() {
+                            st.remote_tried.fetch_add(n, Ordering::Relaxed);
+                            // Accumulate: with several workers reporting,
+                            // storing would leave only whichever spoke
+                            // last and undercount the cluster. The stats
+                            // thread drains this each tick.
+                            st.remote_rate.fetch_add(n, Ordering::Relaxed);
+                        }
+                    } else if let Some(rest) = t.strip_prefix("MATCH ") {
+                        let f: Vec<&str> = rest.split(' ').collect();
+                        if f.len() < 4 {
+                            continue;
+                        }
+                        let rec = MatchRecord {
+                            addr: f[0].to_string(),
+                            wif: f[1].to_string(),
+                            priv_hex: f[2].to_string(),
+                            desc: f[3].replace('_', " "),
+                        };
+                        match verify_remote_match(&rec, &p, &i, &sfx) {
+                            Ok(()) => {
+                                let claimed = st.found_count.fetch_add(1, Ordering::Relaxed);
+                                if max_matches != -1 && claimed >= max_matches {
+                                    st.found_count.fetch_sub(1, Ordering::Relaxed);
+                                    let _ = write_line(&mut stream, &final_msg);
+                                    break;
+                                }
+                                st.last_match_tries
+                                    .store(st.keys_tried.load(Ordering::Relaxed), Ordering::Relaxed);
+                                report_match(
+                                    claimed + 1,
+                                    &format!("{} (from {})", rec.desc, name),
+                                    &rec.addr,
+                                    &rec.wif,
+                                    &rec.priv_hex,
+                                    &st,
+                                );
+                            }
+                            Err(why) => {
+                                eprintln!(
+                                    "⚠️  Rejected a match from {}: {}\n   \
+                                     It was NOT counted. A worker on a different build or a\n   \
+                                     corrupted transfer would both look like this.",
+                                    name, why
+                                );
+                            }
+                        }
+                    } else if t == "BYE" {
+                        break;
+                    }
+
+                    if max_matches != -1 && st.found_count.load(Ordering::Relaxed) >= max_matches {
+                        let _ = write_line(&mut stream, &final_msg);
+                        break;
+                    }
+                }
+                println!("Worker left: {}", name);
+            });
+        }
+    });
+
+    conns
+}
+
+// ---------- worker ----------
+
+/// Serves SHUTDOWN to every worker that connects, so a set of keepalive
+/// workers can be dismissed without running a search. Runs until
+/// interrupted, because workers reconnect on their own schedule and there
+/// is no way to know how many are out there.
+fn run_dismiss(listen: &str, token: &str) {
+    let listener = match TcpListener::bind(listen) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("⚠️  Could not listen on {}: {}", listen, e);
+            std::process::exit(1);
+        }
+    };
+    println!("Dismissing workers on {} — press Ctrl+C when they have all gone.", listen);
+    println!("A keepalive worker retries every few seconds, so give it a moment.\n");
+
+    for incoming in listener.incoming() {
+        let mut stream = match incoming {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".into());
+        let reader_stream = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut reader = BufReader::new(reader_stream);
+        let mut first = String::new();
+        if reader.read_line(&mut first).is_err() {
+            continue;
+        }
+        let parts: Vec<&str> = first.trim().split(' ').collect();
+        if parts.len() >= 4 && parts[0] == "JOIN" && parts[2] == token {
+            let _ = write_line(&mut stream, "SHUTDOWN");
+            println!("Dismissed {} ({})", parts[3], peer);
+        } else {
+            let _ = write_line(&mut stream, "DENY bad-token");
+            println!("Refused {} (wrong token)", peer);
+        }
+    }
+}
+
+/// Why a round of work ended.
+enum WorkerEnd {
+    /// Master says the objective is met. A keepalive worker waits for the
+    /// next one; otherwise this is the end.
+    Stopped,
+    /// Master says exit, regardless of keepalive.
+    Shutdown,
+    /// Connection lost. Treated like Stopped, since a master that was
+    /// interrupted looks exactly like this from here.
+    Disconnected,
+}
+
+/// Connects to a master, adopts its objective, and searches until told to
+/// stop. Never prints or stores a match itself: the master owns results.
+///
+/// With `keepalive`, finishing a round does not end the process — the
+/// worker goes back to waiting for a master. That is what makes a phone
+/// usable as a standing member of a cluster instead of something to be
+/// restarted by hand for every job.
+fn run_cluster_worker(
+    addr: &str,
+    token: &str,
+    name: &str,
+    threads: usize,
+    batch_size: usize,
+    keys_stay_local: bool,
+    keepalive: bool,
+) {
+    println!("--- verus-vanity cluster worker ---");
+    if keepalive {
+        println!("Keepalive: will wait for further objectives until told to shut down.");
+    }
+
+    // Built once and reused for every round; entry i is (i+1)*G regardless
+    // of the objective, so a new job does not need a new table.
+    let table = Arc::new(build_addition_table(batch_size));
+    let endo = setup_endomorphism();
+    let mut announced_wait = false;
+
+    // How long to wait between connection attempts. A failed connect to a
+    // closed port costs almost nothing, so this is kept short: the gap is
+    // also the worst-case delay before a worker picks up a new objective,
+    // and a longer one can miss a short job entirely.
+    const RETRY_SECS: u64 = 2;
+
+    loop {
+        let stream = match TcpStream::connect(addr) {
+            Ok(s) => s,
+            Err(e) => {
+                if !keepalive {
+                    eprintln!("⚠️  Could not connect to {}: {}", addr, e);
+                    std::process::exit(1);
+                }
+                if !announced_wait {
+                    println!("No master at {} — retrying every {}s. ({})", addr, RETRY_SECS, e);
+                    announced_wait = true;
+                }
+                thread::sleep(Duration::from_secs(RETRY_SECS));
+                continue;
+            }
+        };
+        announced_wait = false;
+
+        match run_worker_round(stream, addr, token, name, threads, batch_size, keys_stay_local, &table, endo) {
+            WorkerEnd::Shutdown => {
+                println!("Master dismissed this worker. Exiting.");
+                return;
+            }
+            WorkerEnd::Stopped | WorkerEnd::Disconnected if keepalive => {
+                println!("Round over — waiting for the next objective.\n");
+                // Brief pause so a master that is shutting down has
+                // finished releasing the port before the next attempt.
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            _ => return,
+        }
+    }
+}
+
+/// One round: join, take the objective, search, report, and return the
+/// reason it ended.
+#[allow(clippy::too_many_arguments)]
+fn run_worker_round(
+    mut stream: TcpStream,
+    addr: &str,
+    token: &str,
+    name: &str,
+    threads: usize,
+    batch_size: usize,
+    keys_stay_local: bool,
+    table: &Arc<Vec<(FieldElement, FieldElement)>>,
+    endo: Option<Endomorphism>,
+) -> WorkerEnd {
+    println!("Connected to master at {} as \"{}\".", addr, name);
+
+    let reader_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return WorkerEnd::Disconnected,
+    };
+    let mut reader = BufReader::new(reader_stream);
+
+    if write_line(&mut stream, &format!("JOIN {} {} {}", CLUSTER_PROTO, token, name)).is_err() {
+        return WorkerEnd::Disconnected;
+    }
+
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return WorkerEnd::Disconnected;
+    }
+    let t = line.trim().to_string();
+    if t == "SHUTDOWN" {
+        return WorkerEnd::Shutdown;
+    }
+    if let Some(reason) = t.strip_prefix("DENY ") {
+        eprintln!("⚠️  Master refused this worker: {}", reason);
+        if reason == "bad-token" {
+            eprintln!("   Pass the same --token the master was started with.");
+        }
+        // A wrong token will not fix itself by retrying.
+        std::process::exit(1);
+    }
+    let f: Vec<&str> = t.split(' ').collect();
+    if f.len() < 5 || f[0] != "WORK" {
+        eprintln!("⚠️  Unexpected reply from master: {}", t);
+        return WorkerEnd::Disconnected;
+    }
+    let prefixes = decode_list(f[2]);
+    let infixes = decode_list(f[3]);
+    let suffixes = decode_list(f[4]);
+    let max_matches: i64 = f[1].parse().unwrap_or(-1);
+
+    println!("Objective:");
+    if !prefixes.is_empty() {
+        println!("  prefixes: {}", prefixes.join(", "));
+    }
+    if !infixes.is_empty() {
+        println!("  infixes:  {}", infixes.join(", "));
+    }
+    if !suffixes.is_empty() {
+        println!("  suffixes: {}", suffixes.join(", "));
+    }
+    println!(
+        "  matches wanted: {}",
+        if max_matches == -1 { "unlimited".to_string() } else { max_matches.to_string() }
+    );
+    if keys_stay_local {
+        println!("  --keys-stay-local: only addresses are sent; keys stay in this device's output");
+    } else {
+        println!("  found keys are sent to the master in the clear");
+    }
+    println!("Threads: {}   Batch: {}", threads, batch_size);
+    println!("-----------------------------");
+
+    let (tx, rx) = std::sync::mpsc::channel::<MatchRecord>();
+    let mut state = SharedState::new(&None);
+    state.match_sink = Some(tx);
+
+    let prefix_bounds = try_compute_all_prefix_bounds(&prefixes);
+    let suffix_bounds = try_compute_all_suffix_bounds(&suffixes);
+
+    let mut handles = Vec::new();
+    for _ in 0..threads {
+        let p = prefixes.clone();
+        let i = infixes.clone();
+        let sfx = suffixes.clone();
+        let pb = prefix_bounds.clone();
+        let sb = suffix_bounds.clone();
+        let st = state.clone();
+        let tb = Arc::clone(table);
+        handles.push(thread::spawn(move || {
+            worker_loop(p, sfx, i, pb, sb, -1, st, tb, endo, batch_size);
+        }));
+    }
+
+    // Reader thread: records why the round ended.
+    let stop_flag = Arc::clone(&state.stop);
+    let shutdown_seen = Arc::new(AtomicBool::new(false));
+    let disconnected = Arc::new(AtomicBool::new(false));
+    {
+        let sd = Arc::clone(&shutdown_seen);
+        let dc = Arc::clone(&disconnected);
+        thread::spawn(move || {
+            let mut l = String::new();
+            loop {
+                l.clear();
+                match reader.read_line(&mut l) {
+                    Ok(0) | Err(_) => {
+                        dc.store(true, Ordering::Relaxed);
+                        stop_flag.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+                match l.trim() {
+                    "STOP" => {
+                        stop_flag.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    "SHUTDOWN" => {
+                        sd.store(true, Ordering::Relaxed);
+                        stop_flag.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    let mut last_reported = 0u64;
+    let start = Instant::now();
+    let mut lost = false;
+    loop {
+        thread::sleep(Duration::from_secs(1));
+
+        while let Ok(rec) = rx.try_recv() {
+            let payload = if keys_stay_local {
+                println!("MATCH kept on this device: {}", rec.addr);
+                println!("  WIF: {}", rec.wif);
+                println!("  Private Key (hex): {}", rec.priv_hex);
+                format!("MATCH {} - - {}", rec.addr, rec.desc.replace(' ', "_"))
+            } else {
+                format!(
+                    "MATCH {} {} {} {}",
+                    rec.addr, rec.wif, rec.priv_hex, rec.desc.replace(' ', "_")
+                )
+            };
+            let _ = write_line(&mut stream, &payload);
+        }
+
+        let total = state.keys_tried.load(Ordering::Relaxed);
+        let delta = total.saturating_sub(last_reported);
+        last_reported = total;
+        if write_line(&mut stream, &format!("RATE {}", delta)).is_err() {
+            lost = true;
+        } else {
+            println!(
+                "Contributed: {} ({} total in {:.0}s)",
+                format_with_si_rate(delta),
+                format_with_si(total),
+                start.elapsed().as_secs_f64()
+            );
+        }
+
+        if lost || state.stop.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+
+    // Let the search threads notice the flag and finish, so a keepalive
+    // round does not leave them running behind the next one.
+    state.stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        let _ = h.join();
+    }
+    let _ = write_line(&mut stream, "BYE");
+
+    if shutdown_seen.load(Ordering::Relaxed) {
+        WorkerEnd::Shutdown
+    } else if disconnected.load(Ordering::Relaxed) || lost {
+        println!("Master went away.");
+        WorkerEnd::Disconnected
+    } else {
+        println!("Master says the objective is met.");
+        WorkerEnd::Stopped
+    }
 }
 
 // ===================== Entry point =====================
@@ -2739,7 +3803,6 @@ fn main() {
     // desktop/server systems and many phones don't expose this), in
     // which case every thread below just gets None and runs under
     // normal OS scheduling.
-    let core_order = fastest_cores_first();
 
     // Precompute G, 2G, ..., BATCH_SIZE*G once. Every thread shares this
     // single read-only copy (~40KB): each worker hoists it to a plain
@@ -2747,16 +3810,32 @@ fn main() {
     // indirection in the loop itself, and one copy stays resident in the
     // caches that sibling cores share instead of N copies evicting one
     // another.
-    let table = Arc::new(build_addition_table());
+    let table = Arc::new(build_addition_table(config.batch_size));
 
     let state = SharedState::new(&config.output_file);
     let start_time = Instant::now();
     let target_matches: f64 = if config.max_matches == -1 { 1.0 } else { config.max_matches.max(1) as f64 };
 
+    // Master mode: serve the objective and collect verified results while
+    // this machine searches alongside the workers.
+    let mut worker_conns: Option<Arc<Mutex<Vec<TcpStream>>>> = None;
+    if let Some(listen) = config.serve.clone() {
+        worker_conns = Some(spawn_cluster_master(
+            listen,
+            config.token.clone(),
+            config.prefixes.clone(),
+            config.infixes.clone(),
+            config.suffixes.clone(),
+            config.max_matches,
+            state.clone(),
+            config.stop_workers,
+        ));
+    }
+
     spawn_stats_thread(state.clone(), start_time, expected, target_matches);
 
     let mut handles = Vec::new();
-    for i in 0..config.threads {
+    for _ in 0..config.threads {
         let prefixes = config.prefixes.clone();
         let suffixes = config.suffixes.clone();
         let infixes = config.infixes.clone();
@@ -2764,17 +3843,39 @@ fn main() {
         let suffix_bounds = suffix_bounds.clone();
         let state = state.clone();
         let max_matches = config.max_matches;
+        let batch_size = config.batch_size;
         // Fastest core first, cycling if there are more threads than
         // detected cores (e.g. -t set above the core count).
-        let pinned_core = core_order.as_ref().map(|order| order[i % order.len()]);
         let table = Arc::clone(&table);
         handles.push(thread::spawn(move || {
-            worker_loop(prefixes, suffixes, infixes, prefix_bounds, suffix_bounds, max_matches, state, pinned_core, table, endo)
+            worker_loop(prefixes, suffixes, infixes, prefix_bounds, suffix_bounds, max_matches, state, table, endo, batch_size)
         }));
     }
 
     for handle in handles {
         handle.join().unwrap();
+    }
+
+    // Objective met: tell the workers directly rather than letting them
+    // infer it from the socket closing. STOP lets a keepalive worker idle
+    // for the next job; SHUTDOWN ends it. Without this the process would
+    // exit first and they would only ever see a disconnect.
+    if let Some(conns) = worker_conns {
+        let msg = if config.stop_workers { "SHUTDOWN" } else { "STOP" };
+        if let Ok(mut list) = conns.lock() {
+            for c in list.iter_mut() {
+                let _ = write_line(c, msg);
+            }
+            if !list.is_empty() {
+                println!(
+                    "Told {} worker(s) to {}.",
+                    list.len(),
+                    if config.stop_workers { "shut down" } else { "stand by" }
+                );
+            }
+        }
+        // Give the writes a moment to land before the process goes away.
+        thread::sleep(Duration::from_millis(300));
     }
 }
 
@@ -2981,7 +4082,7 @@ mod tests {
     /// point k256 computes for the same scalar.
     #[test]
     fn fused_batch_generation_matches_k256() {
-        let table = build_addition_table();
+        let table = build_addition_table(BATCH_SIZE);
         let mut rng = rand::thread_rng();
         let base_scalar = Scalar::random(&mut rng);
         let (px, py) = affine_xy(&(ProjectivePoint::GENERATOR * base_scalar).to_affine()).unwrap();
