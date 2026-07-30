@@ -1,6 +1,6 @@
 [package]
 name = "verus-vanity"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
@@ -15,7 +15,6 @@ ripemd = "0.1"
 bs58 = "0.5"
 hex = "0.4"
 num_cpus = "1.16"
-core_affinity = "0.8"
 qrcode = { version = "0.14", default-features = false }
 zeroize = "=1.7.0"
 base64ct = "=1.6.0"
