@@ -33,7 +33,7 @@ use rand_chacha::ChaCha20Rng;
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1752,7 +1752,7 @@ fn parse_cli() -> Config {
     let cpu_cores_str: &'static str = Box::leak(num_cpus::get().to_string().into_boxed_str());
 
     let matches = Command::new("verus-vanity")
-        .version("0.8.0")
+        .version("0.8.1")
         .author("Darktron")
         .about("VerusCoin Vanity Wallet Generator\nMade by Darktron")
         .disable_version_flag(true)
@@ -1883,6 +1883,8 @@ fn parse_cli() -> Config {
         run_bench();
         std::process::exit(0);
     }
+
+    validate_token_or_exit(matches.get_one::<String>("token").map(|s| s.as_str()).unwrap_or(""));
 
     if let Some(listen) = matches.get_one::<String>("dismiss") {
         run_dismiss(
@@ -2303,6 +2305,27 @@ fn report_match(found_num: i64, desc: &str, addr: &str, wif: &str, priv_hex: &st
             wif: wif.to_string(),
             priv_hex: priv_hex.to_string(),
         });
+        return;
+    }
+
+    // A match whose key stayed on the worker has no WIF to print and no
+    // QR to scan; say where it actually is instead of showing "-".
+    if wif == "-" && priv_hex == "-" {
+        let body = format!(
+            "----- MATCH {} for {} FOUND -----\nAddress: {}\n\
+             The private key stayed on the worker that found it (--keys-stay-local).\n\
+             Collect it from that device's output; the address above is verified.\n\
+             -------------------------\n",
+            found_num, desc, addr
+        );
+        let _guard = state.report_lock.lock().unwrap_or_else(|e| e.into_inner());
+        print!("{}\n", body);
+        let _ = std::io::stdout().flush();
+        if let Some(output_mutex) = &state.output_writer {
+            let mut output = output_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            write!(output, "{}\n", body).ok();
+            output.flush().ok();
+        }
         return;
     }
 
@@ -3211,6 +3234,27 @@ fn run_bench() {
 
 const CLUSTER_PROTO: &str = "v1";
 
+/// Longest protocol line accepted from a peer. Every legitimate message
+/// is well under this; the cap exists because `read_line` will otherwise
+/// grow its buffer for as long as a peer keeps sending without a
+/// newline, which is a way to exhaust memory from the far end of a
+/// socket.
+const MAX_LINE_BYTES: u64 = 8 * 1024;
+
+/// `read_line` with a ceiling. Returns Ok(0) at end of stream, and an
+/// error if the peer exceeds the cap so the caller drops the connection.
+fn read_line_capped(reader: &mut BufReader<TcpStream>, buf: &mut String) -> std::io::Result<usize> {
+    buf.clear();
+    let n = std::io::Read::take(reader.by_ref(), MAX_LINE_BYTES).read_line(buf)?;
+    if n as u64 >= MAX_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer sent an over-long line",
+        ));
+    }
+    Ok(n)
+}
+
 /// A found keypair, as passed between threads and over the wire.
 #[derive(Clone)]
 struct MatchRecord {
@@ -3238,12 +3282,55 @@ fn decode_list(field: &str) -> Vec<String> {
 
 /// Re-derives the address from a received private key and confirms it
 /// matches both the claim and the search patterns. See the module note.
+/// True when the worker deliberately withheld the key (`--keys-stay-local`).
+fn is_held_remotely(rec: &MatchRecord) -> bool {
+    rec.wif == "-" && rec.priv_hex == "-"
+}
+
+/// Checks that a string really is a well-formed VerusCoin address:
+/// Base58Check of 25 bytes, right version, intact checksum. Used for
+/// matches whose key stayed on the worker, where there is no key to
+/// derive from.
+fn validate_address_string(addr: &str) -> Result<(), String> {
+    let raw = bs58::decode(addr).into_vec().map_err(|_| "not valid Base58".to_string())?;
+    if raw.len() != 25 {
+        return Err(format!("decodes to {} bytes, expected 25", raw.len()));
+    }
+    if raw[0] != ADDRESS_VERSION_BYTE {
+        return Err(format!("version byte is 0x{:02x}, expected 0x{:02x}", raw[0], ADDRESS_VERSION_BYTE));
+    }
+    let checksum = Sha256::digest(Sha256::digest(&raw[0..21]));
+    if checksum[0..4] != raw[21..25] {
+        return Err("checksum does not match".into());
+    }
+    Ok(())
+}
+
 fn verify_remote_match(
     rec: &MatchRecord,
     prefixes: &[String],
     infixes: &[String],
     suffixes: &[String],
 ) -> Result<(), String> {
+    // A worker running --keys-stay-local sends no key on purpose, so
+    // there is nothing to derive from. Verify what can be verified: that
+    // the address is genuinely well-formed and is what was asked for.
+    //
+    // This is deliberately weaker — the master cannot prove the worker
+    // actually holds the key, only that it is quoting a real address that
+    // fits. That is the trade being made by keeping keys off the network,
+    // and the report says so.
+    if is_held_remotely(rec) {
+        validate_address_string(&rec.addr)?;
+        let p_ok = match_any_prefix(prefixes, &rec.addr).is_some();
+        let i_ok = match_any_infix(infixes, &rec.addr).is_some();
+        let s_ok = match_any_suffix(suffixes, &rec.addr).is_some();
+        if !(p_ok && i_ok && s_ok) {
+            return Err(format!("{} does not satisfy the requested patterns", rec.addr));
+        }
+        return Ok(());
+    }
+
     let bytes = match hex::decode(&rec.priv_hex) {
         Ok(b) => b,
         Err(_) => return Err("private key is not valid hex".into()),
@@ -3278,6 +3365,23 @@ fn verify_remote_match(
         return Err("WIF does not match the private key".into());
     }
     Ok(())
+}
+
+/// Rejects a token that cannot survive the wire format.
+///
+/// JOIN is a space-delimited line, so a token containing whitespace is
+/// split across fields: both ends can pass the identical --token and
+/// still fail with "bad-token", while the worker name is mangled too.
+/// Catching it at startup turns a confusing authentication failure into
+/// a clear message.
+fn validate_token_or_exit(token: &str) {
+    if token.chars().any(|c| c.is_whitespace()) {
+        eprintln!("⚠️  --token cannot contain spaces or tabs.");
+        eprintln!("   The join message is space-delimited, so a token with whitespace");
+        eprintln!("   is split apart and never matches — even when both sides pass the");
+        eprintln!("   same thing. Use a single word, e.g. --token my-secret");
+        std::process::exit(1);
+    }
 }
 
 fn write_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
@@ -3357,7 +3461,7 @@ fn spawn_cluster_master(
                 };
                 let mut reader = BufReader::new(reader_stream);
                 let mut first = String::new();
-                if reader.read_line(&mut first).is_err() {
+                if read_line_capped(&mut reader, &mut first).is_err() {
                     return;
                 }
 
@@ -3398,7 +3502,7 @@ fn spawn_cluster_master(
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    match reader.read_line(&mut line) {
+                    match read_line_capped(&mut reader, &mut line) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
@@ -3497,7 +3601,7 @@ fn run_dismiss(listen: &str, token: &str) {
         };
         let mut reader = BufReader::new(reader_stream);
         let mut first = String::new();
-        if reader.read_line(&mut first).is_err() {
+        if read_line_capped(&mut reader, &mut first).is_err() {
             continue;
         }
         let parts: Vec<&str> = first.trim().split(' ').collect();
@@ -3618,7 +3722,7 @@ fn run_worker_round(
     }
 
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    if read_line_capped(&mut reader, &mut line).is_err() {
         return WorkerEnd::Disconnected;
     }
     let t = line.trim().to_string();
@@ -3697,7 +3801,7 @@ fn run_worker_round(
             let mut l = String::new();
             loop {
                 l.clear();
-                match reader.read_line(&mut l) {
+                match read_line_capped(&mut reader, &mut l) {
                     Ok(0) | Err(_) => {
                         dc.store(true, Ordering::Relaxed);
                         stop_flag.store(true, Ordering::Relaxed);
