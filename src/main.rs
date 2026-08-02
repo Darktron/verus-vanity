@@ -1430,10 +1430,31 @@ fn parse_base58_number(s: &str) -> Option<u64> {
 /// byte-by-byte so it never needs a number bigger than fits in u128 —
 /// avoids needing a general bignum library for this.
 fn first21_mod(first21: &[u8; 21], modulus: u64) -> u64 {
-    let mut r: u128 = 0;
-    for &byte in first21.iter() {
-        r = (r * 256 + byte as u128) % modulus as u128;
+    // Eight bytes at a time rather than one.
+    //
+    // This runs for every candidate of a suffix search, and a 128-bit
+    // division is far from free, so doing 21 of them per address was the
+    // single largest cost in that path. Folding a whole u64 per step
+    // needs only three.
+    //
+    // The intermediate cannot overflow: `modulus` is 58^k for k <= 10, so
+    // it is below 2^59 and any remainder is below that too. Shifting a
+    // sub-2^59 value up by 64 bits reaches at most 2^123, and adding a
+    // u64 keeps it under 2^124 — comfortably inside u128.
+    debug_assert!(modulus < (1u64 << 59), "modulus must stay small enough to shift by 64");
+    let m = modulus as u128;
+    let hi = u64::from_be_bytes(first21[0..8].try_into().unwrap()) as u128;
+    let mid = u64::from_be_bytes(first21[8..16].try_into().unwrap()) as u128;
+
+    let mut r = hi % m;
+    r = ((r << 64) | mid) % m;
+
+    // The trailing five bytes, folded in one step.
+    let mut tail: u128 = 0;
+    for &b in &first21[16..21] {
+        tail = (tail << 8) | b as u128;
     }
+    r = ((r << 40) | tail) % m;
     r as u64
 }
 
@@ -1743,6 +1764,8 @@ struct Config {
     token: String,
     /// Tell workers to exit rather than idle when the objective is met.
     stop_workers: bool,
+    /// Seconds between ETA refreshes; 0 means print it once.
+    eta_every: u64,
 }
 
 /// Parses CLI arguments, auto-normalizes prefixes (see `normalize_prefix`),
@@ -1812,26 +1835,38 @@ fn parse_cli() -> Config {
                 .num_args(1),
         )
         .arg(
+            Arg::new("eta")
+                .short('e')
+                .long("eta")
+                .help("Seconds between ETA refreshes; 0 shows it once only")
+                .default_value("30")
+                .num_args(1),
+        )
+        .arg(
             Arg::new("serve")
+                .short('S')
                 .long("serve")
                 .help("Run as cluster master on ADDR:PORT (also searches locally)")
                 .num_args(1),
         )
         .arg(
             Arg::new("join")
+                .short('J')
                 .long("join")
                 .help("Run as cluster worker, taking the objective from the master at ADDR:PORT")
                 .num_args(1),
         )
         .arg(
-            Arg::new("token")
-                .long("token")
+            Arg::new("pass")
+                .short('P')
+                .long("pass")
                 .help("Shared word a worker must present to join a cluster")
                 .default_value("")
                 .num_args(1),
         )
         .arg(
             Arg::new("name")
+                .short('N')
                 .long("name")
                 .help("Name this worker reports to the master [default: hostname-ish]")
                 .num_args(1),
@@ -1851,6 +1886,7 @@ fn parse_cli() -> Config {
         )
         .arg(
             Arg::new("dismiss")
+                .short('d')
                 .long("dismiss")
                 .help("Shut down every worker that connects to ADDR:PORT, then exit")
                 .num_args(1),
@@ -1884,12 +1920,12 @@ fn parse_cli() -> Config {
         std::process::exit(0);
     }
 
-    validate_token_or_exit(matches.get_one::<String>("token").map(|s| s.as_str()).unwrap_or(""));
+    validate_token_or_exit(matches.get_one::<String>("pass").map(|s| s.as_str()).unwrap_or(""));
 
     if let Some(listen) = matches.get_one::<String>("dismiss") {
         run_dismiss(
             listen,
-            matches.get_one::<String>("token").map(|s| s.as_str()).unwrap_or(""),
+            matches.get_one::<String>("pass").map(|s| s.as_str()).unwrap_or(""),
         );
         std::process::exit(0);
     }
@@ -1920,7 +1956,7 @@ fn parse_cli() -> Config {
             .replace(' ', "_");
         run_cluster_worker(
             master,
-            matches.get_one::<String>("token").map(|s| s.as_str()).unwrap_or(""),
+            matches.get_one::<String>("pass").map(|s| s.as_str()).unwrap_or(""),
             &name,
             threads,
             batch,
@@ -2053,8 +2089,12 @@ fn parse_cli() -> Config {
         threads,
         batch_size,
         serve: matches.get_one::<String>("serve").cloned(),
-        token: matches.get_one::<String>("token").cloned().unwrap_or_default(),
+        token: matches.get_one::<String>("pass").cloned().unwrap_or_default(),
         stop_workers: matches.get_flag("stop-workers"),
+        eta_every: matches
+            .get_one::<String>("eta")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30),
         max_matches,
         output_file,
         any_normalized,
@@ -2224,16 +2264,30 @@ impl SharedState {
 /// Spawns the background thread that prints search progress once a
 /// second: a one-time typical-time-to-find estimate the first time a real
 /// rate is available, then an ongoing simple progress percentage.
-fn spawn_stats_thread(state: SharedState, start_time: Instant, expected: f64, target_matches: f64) {
+fn spawn_stats_thread(
+    state: SharedState,
+    start_time: Instant,
+    expected: f64,
+    target_matches: f64,
+    eta_every: u64,
+) {
     thread::spawn(move || {
         let keys_tried_last = AtomicU64::new(0);
+        let mut last_eta = Instant::now();
+        let mut total_at_last_eta: u64 = 0;
         let mut printed_estimate = false;
 
         loop {
             thread::sleep(Duration::from_secs(1));
-            let total = state.keys_tried.load(Ordering::Relaxed);
+            let local_total = state.keys_tried.load(Ordering::Relaxed);
+            // Everything below works on the COMBINED figure. Using the
+            // local counter alone understated progress and overstated the
+            // ETA the moment a worker joined, because the addresses they
+            // contributed were simply not in the sum.
+            let remote_total = state.remote_tried.load(Ordering::Relaxed);
+            let total = local_total + remote_total;
             let last = keys_tried_last.swap(total, Ordering::Relaxed);
-            let rate = total.saturating_sub(last);
+            let combined_rate = total.saturating_sub(last);
 
             let elapsed = start_time.elapsed().as_secs_f64();
             let average_rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
@@ -2242,14 +2296,40 @@ fn spawn_stats_thread(state: SharedState, start_time: Instant, expected: f64, ta
             let remaining_matches = (target_matches - found_so_far).max(0.0);
             let p_per_try = if expected.is_finite() && expected > 0.0 { 1.0 / expected } else { 0.0 };
 
-            // Printed once, the first time a real rate is available — a
-            // typical (median) time to find, not a countdown. It won't
-            // reappear or shrink as the search runs; ongoing progress is
-            // shown by the simple percentage below instead.
-            if !printed_estimate && average_rate > 0.0 && remaining_matches > 0.0 {
-                let t50 = tries_for_probability(p_per_try, 0.5) * remaining_matches / average_rate;
-                println!("Estimated typical time to find: ~{}\n", format_duration(t50));
+            // A typical (median) time to find, not a countdown.
+            //
+            // Refreshed on a cadence rather than printed once: a cluster
+            // gains workers over time, and an estimate taken from the
+            // first second of a solo run is badly wrong the moment three
+            // phones join. `-e` sets the interval; `-e 0` keeps the old
+            // print-once behaviour.
+            let due = !printed_estimate
+                || (eta_every > 0 && last_eta.elapsed() >= Duration::from_secs(eta_every));
+            // Rate over the window since the last refresh, not the average
+            // since launch. A cumulative average barely moves when workers
+            // join half an hour in — it is dominated by all the time they
+            // were not there — so the ETA would keep quoting the solo
+            // figure. A recent window reflects the cluster as it is now.
+            let window_secs = last_eta.elapsed().as_secs_f64().max(1.0);
+            let window_rate = if printed_estimate {
+                total.saturating_sub(total_at_last_eta) as f64 / window_secs
+            } else {
+                average_rate
+            };
+            if due && window_rate > 0.0 && remaining_matches > 0.0 {
+                let t50 = tries_for_probability(p_per_try, 0.5) * remaining_matches / window_rate;
+                if printed_estimate {
+                    println!(
+                        "ETA refreshed: ~{} at {} combined",
+                        format_duration(t50),
+                        format_with_si_rate(window_rate as u64)
+                    );
+                } else {
+                    println!("Estimated typical time to find: ~{}\n", format_duration(t50));
+                }
                 printed_estimate = true;
+                last_eta = Instant::now();
+                total_at_last_eta = total;
             }
 
             // Simple progress gauge: probability you'd already have a
@@ -2268,14 +2348,13 @@ fn spawn_stats_thread(state: SharedState, start_time: Instant, expected: f64, ta
             // taking and clearing it gives the cluster's contribution for
             // this interval.
             let rrate = state.remote_rate.swap(0, Ordering::Relaxed);
-            let rtried = state.remote_tried.load(Ordering::Relaxed);
-            if rtried > 0 || rrate > 0 {
+            if remote_total > 0 || rrate > 0 {
                 println!(
                     "Progress: {} ({} tried, {}) [local {} + cluster {}]",
                     progress,
-                    format_with_si(total + rtried),
-                    format_with_si_rate(rate + rrate),
-                    format_with_si_rate(rate),
+                    format_with_si(total),
+                    format_with_si_rate(combined_rate),
+                    format_with_si_rate(combined_rate.saturating_sub(rrate)),
                     format_with_si_rate(rrate)
                 );
             } else {
@@ -2283,7 +2362,7 @@ fn spawn_stats_thread(state: SharedState, start_time: Instant, expected: f64, ta
                     "Progress: {} ({} tried, {})",
                     progress,
                     format_with_si(total),
-                    format_with_si_rate(rate)
+                    format_with_si_rate(combined_rate)
                 );
             }
         }
@@ -3203,7 +3282,7 @@ fn run_bench() {
 // dependencies beyond std: patterns are Base58, which cannot contain a
 // space or a comma, so framing needs nothing clever.
 //
-//   worker -> master   JOIN <proto> <token> <name>
+//   worker -> master   JOIN <proto> <pass> <name>
 //   master -> worker   WORK <max_matches> <prefixes> <infixes> <suffixes>
 //                      DENY <reason>
 //   worker -> master   RATE <addresses-since-last-report>
@@ -3367,19 +3446,19 @@ fn verify_remote_match(
     Ok(())
 }
 
-/// Rejects a token that cannot survive the wire format.
+/// Rejects a pass phrase that cannot survive the wire format.
 ///
-/// JOIN is a space-delimited line, so a token containing whitespace is
-/// split across fields: both ends can pass the identical --token and
-/// still fail with "bad-token", while the worker name is mangled too.
+/// JOIN is a space-delimited line, so a pass containing whitespace is
+/// split across fields: both ends can give the identical --pass and
+/// still fail with "bad-pass", while the worker name is mangled too.
 /// Catching it at startup turns a confusing authentication failure into
 /// a clear message.
 fn validate_token_or_exit(token: &str) {
     if token.chars().any(|c| c.is_whitespace()) {
-        eprintln!("⚠️  --token cannot contain spaces or tabs.");
+        eprintln!("⚠️  --pass cannot contain spaces or tabs.");
         eprintln!("   The join message is space-delimited, so a token with whitespace");
         eprintln!("   is split apart and never matches — even when both sides pass the");
-        eprintln!("   same thing. Use a single word, e.g. --token my-secret");
+        eprintln!("   same thing. Use a single word, e.g. --pass my-secret");
         std::process::exit(1);
     }
 }
@@ -3427,7 +3506,7 @@ fn spawn_cluster_master(
     };
     println!("Cluster master listening on {}", listen);
     if token.is_empty() {
-        println!("  no --token set: any device that can reach this port may join");
+        println!("  no --pass set: any device that can reach this port may join");
     }
     println!(
         "  workers send private keys in the clear — use this on a network you\n  \
@@ -3476,8 +3555,8 @@ fn spawn_cluster_master(
                     return;
                 }
                 if parts[2] != token {
-                    let _ = write_line(&mut stream, "DENY bad-token");
-                    eprintln!("Rejected {}: wrong token", peer);
+                    let _ = write_line(&mut stream, "DENY bad-pass");
+                    eprintln!("Rejected {}: wrong pass", peer);
                     return;
                 }
                 let name = parts[3].to_string();
@@ -3609,8 +3688,8 @@ fn run_dismiss(listen: &str, token: &str) {
             let _ = write_line(&mut stream, "SHUTDOWN");
             println!("Dismissed {} ({})", parts[3], peer);
         } else {
-            let _ = write_line(&mut stream, "DENY bad-token");
-            println!("Refused {} (wrong token)", peer);
+            let _ = write_line(&mut stream, "DENY bad-pass");
+            println!("Refused {} (wrong pass)", peer);
         }
     }
 }
@@ -3731,8 +3810,8 @@ fn run_worker_round(
     }
     if let Some(reason) = t.strip_prefix("DENY ") {
         eprintln!("⚠️  Master refused this worker: {}", reason);
-        if reason == "bad-token" {
-            eprintln!("   Pass the same --token the master was started with.");
+        if reason == "bad-pass" {
+            eprintln!("   Pass the same --pass the master was started with.");
         }
         // A wrong token will not fix itself by retrying.
         std::process::exit(1);
@@ -3936,7 +4015,7 @@ fn main() {
         ));
     }
 
-    spawn_stats_thread(state.clone(), start_time, expected, target_matches);
+    spawn_stats_thread(state.clone(), start_time, expected, target_matches, config.eta_every);
 
     let mut handles = Vec::new();
     for _ in 0..config.threads {
