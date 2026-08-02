@@ -51,6 +51,12 @@ Made by Darktron
 Usage: verus-vanity [OPTIONS]
 
 Options:
+VerusCoin Vanity Wallet Generator
+Made by Darktron
+
+Usage: verus-vanity [OPTIONS]
+
+Options:
   -p, --prefix <prefix>    Prefix string or filename with prefixes (one per line)
   -i, --infix <infix>      Infix string or filename with infixes (one per line)
   -s, --suffix <suffix>    Suffix string or filename with suffixes (one per line)
@@ -58,13 +64,14 @@ Options:
   -t, --threads <threads>  Number of threads (default = number of CPU cores) [default: 12]
   -o, --output <output>    Output file to save found wallets
   -b, --batch <batch>      Points per batch (min = RIPEMD lane count; max scales with -t and RAM)
-      --serve <serve>      Run as cluster master on ADDR:PORT (also searches locally)
-      --join <join>        Run as cluster worker, taking the objective from the master at ADDR:PORT
-      --token <token>      Shared word a worker must present to join a cluster [default: ]
-      --name <name>        Name this worker reports to the master [default: hostname-ish]
+  -e, --eta <eta>          Seconds between ETA refreshes; 0 shows it once only [default: 30]
+  -S, --serve <serve>      Run as cluster master on ADDR:PORT (also searches locally)
+  -J, --join <join>        Run as cluster worker, taking the objective from the master at ADDR:PORT
+  -P, --pass <pass>        Shared word a worker must present to join a cluster [default: ]
+  -N, --name <name>        Name this worker reports to the master [default: hostname-ish]
   -k, --keepalive          Worker: stay running when the master stops, and wait for the next objective
       --stop-workers       Master: tell workers to exit when the objective is met, even keepalive ones
-      --dismiss <dismiss>  Shut down every worker that connects to ADDR:PORT, then exit
+  -d, --dismiss <dismiss>  Shut down every worker that connects to ADDR:PORT, then exit
       --keys-stay-local    Worker keeps found keys on its own machine; only addresses are sent
   -B, --bench              Measure per-stage throughput on this machine and exit
   -v, --version            Print version
